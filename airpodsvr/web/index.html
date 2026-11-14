@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FBT Pods</title>
+<link rel="stylesheet" href="app.css">
+<script src="i18n-data.js"></script>
+<script src="i18n.js"></script>
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <div class="logo" aria-hidden="true">
+        <svg viewBox="0 0 32 32"><defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#64d2ff"/><stop offset="1" stop-color="#0a84ff"/></linearGradient></defs>
+          <path d="M11 4c-3 0-5 2.4-5 5.5 0 2.6 1.6 4.4 3.6 5V27a2 2 0 0 0 4 0V9.5C13.6 6.4 12.6 4 11 4Z" fill="url(#lg)"/>
+          <path d="M21 4c3 0 5 2.4 5 5.5 0 2.6-1.6 4.4-3.6 5V27a2 2 0 0 1-4 0V9.5C18.4 6.4 19.4 4 21 4Z" fill="url(#lg)" opacity=".75"/></svg>
+      </div>
+      <div><div class="brand-name">FBT Pods</div><div class="brand-sub">AirPods 全身追蹤</div></div>
+    </div>
+    <nav>
+      <button class="nav active" data-page="overview"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="2"/><rect x="13.5" y="3.5" width="7" height="7" rx="2"/><rect x="3.5" y="13.5" width="7" height="7" rx="2"/><rect x="13.5" y="13.5" width="7" height="7" rx="2"/></svg><span>總覽</span></button>
+      <button class="nav" data-page="reset"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><path d="M4.5 12a7.5 7.5 0 1 0 2.4-5.5"/><path d="M4 4.5v4h4"/></svg><span>重置</span></button>
+      <button class="nav" data-page="calib"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7.5"/><path d="M12 2.5v4M12 17.5v4M2.5 12h4M17.5 12h4"/></svg><span>校正</span></button>
+      <button class="nav" data-page="sensors"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><path d="M2.5 12h4l2.2-6 3.6 12 2.6-8 1.6 2h5"/></svg><span>感測器測試</span></button>
+      <button class="nav" data-page="settings"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2.2"/><circle cx="9" cy="17" r="2.2"/></svg><span>設定</span></button>
+      <button class="nav" data-page="advanced"><svg class="ni" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5.5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18.5" cy="12" r="1.4"/></svg><span>進階</span></button>
+    </nav>
+    <div class="side-foot">
+      <button class="ghost small" id="btn-quit">結束 FBT Pods</button>
+      <div class="version" id="version" title="回報問題時請附上這個版本"></div>
+    </div>
+  </aside>
+
+  <main>
+    <header class="top">
+      <div>
+        <h1 id="page-title">總覽</h1>
+        <div class="sub" id="page-sub">準備項目都亮綠燈就能開始追蹤</div>
+      </div>
+      <div class="top-actions">
+        <span class="pill" id="run-pill"><i></i><b>未啟動</b></span>
+        <button class="secondary" id="btn-demo">試用模式</button>
+        <button class="primary" id="btn-run">開始追蹤</button>
+      </div>
+    </header>
+
+    <!-- 總覽 -->
+    <section class="page active" id="page-overview">
+      <div class="grid g-overview">
+        <div class="card">
+          <div class="card-h"><h2>準備狀態</h2></div>
+          <ul class="checklist" id="checklist"></ul>
+        </div>
+        <div class="card viewer">
+          <div class="card-h"><h2>即時姿勢</h2>
+            <div class="seg" id="view-seg"><button class="on" data-v="side">側視</button><button data-v="top">俯視</button></div></div>
+          <canvas id="skel" width="560" height="340"></canvas>
+          <div class="legend"><span class="lg l"></span>左腳<span class="lg r"></span>右腳<span class="muted" id="model-chip"></span></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h2>追蹤器</h2></div>
+          <div class="legs" id="legs"></div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h2>電量</h2></div>
+          <div class="battery" id="battery"><span class="muted">連線後顯示</span></div>
+        </div>
+      </div>
+      <div class="quick-actions">
+        <button class="secondary small" data-action="full_reset" data-delay="5">完整重置</button>
+        <button class="secondary small" data-action="quick_reset">快速重置</button>
+        <button class="secondary small" data-action="pause">暫停／恢復</button>
+      </div>
+      <div class="banner" id="calib-banner" hidden>
+        <div><b>尚未校正。</b>第一次請執行校正精靈；之後每次只要站直按「完整重置」。</div>
+        <button class="primary small" data-flow="wizard">開始校正</button>
+      </div>
+    </section>
+
+    <!-- 重置 -->
+    <section class="page" id="page-reset">
+      <div class="banner slime-note"><div><b>身體由 SlimeVR Server 計算。</b>完整重置、快速重置、暫停會轉交給 SlimeVR；貼合重置不適用。</div>
+        <button class="secondary small" data-flow="slimevr">說明</button></div>
+      <div class="grid g-3">
+        <button class="tile" data-action="full_reset" data-delay="5">
+          <div class="tile-ico">⟳</div><div class="tile-t">完整重置</div>
+          <div class="tile-d">站直、看正前方。開場與換綁帶後使用，倒數 5 秒後執行。</div>
+          <div class="kbd">左手 Y／B 長按</div></button>
+        <button class="tile" data-action="quick_reset">
+          <div class="tile-ico">↻</div><div class="tile-t">快速重置</div>
+          <div class="tile-d">任何姿勢都能按，用最近量到的偏差修正方向。</div>
+          <div class="kbd">左手 Y／B 雙擊</div></button>
+        <button class="tile" data-action="pause">
+          <div class="tile-ico">❚❚</div><div class="tile-t">暫停／恢復</div>
+          <div class="tile-d">調整綁帶時暫停輸出。</div>
+          <div class="kbd">沒有手把按鍵</div></button>
+        <button class="tile" data-action="touch_reset" data-hand="left_hand" data-delay="5">
+          <div class="tile-ico">◐</div><div class="tile-t">貼合重置（左手把）</div>
+          <div class="tile-d">左手把貼在左小腿正面，倒數 5 秒後執行。</div>
+          <div class="kbd">左手 X 長按</div></button>
+        <button class="tile" data-action="touch_reset" data-hand="right_hand" data-delay="5">
+          <div class="tile-ico">◑</div><div class="tile-t">貼合重置（右手把）</div>
+          <div class="tile-d">右手把貼在右小腿正面，倒數 5 秒後執行。</div>
+          <div class="kbd">右手 B 長按</div></button>
+      </div>
+      <div class="card mt">
+        <div class="card-h"><h2>貼合重置怎麼貼</h2></div>
+        <p class="body">躺著、盤腿時也準。手把<b>有搖桿和按鍵的那一面朝外、扳機那一側貼著脛骨、前端朝腳掌</b>，和校正精靈登記時相同。手把短震一下是成功，震兩下是沒貼平。</p>
+        <p class="body muted">改按鍵：SteamVR 設定 → 控制器 → 顯示綁定介面 → FBT Pods。Index 手把用 B／A，Vive 手把用選單鍵。</p>
+      </div>
+    </section>
+
+    <!-- 校正 -->
+    <section class="page" id="page-calib">
+      <div class="banner slime-note"><div><b>身體由 SlimeVR Server 計算。</b>身體比例與配戴校正請在 SlimeVR 裡做，這一頁不適用。</div>
+        <button class="secondary small" data-flow="slimevr">說明</button></div>
+      <div class="card">
+        <div class="card-h"><h2>校正精靈</h2><span class="hint">約 1 分鐘，戴著頭顯</span></div>
+        <ol class="steps">
+          <li><b>站直</b><span>雙腳平行、看正前方</span></li>
+          <li><b>滑雪姿勢</b><span>膝蓋往前彎、腳掌貼地，量測綁帶角度</span></li>
+          <li><b>再站直</b><span>完整重置，同時量身高</span></li>
+          <li><b>左右腳各伸直往前</b><span>校正腳的朝向，可略過</span></li>
+          <li><b>手把貼腿</b><span>每個腿部感測器登記一次貼合重置</span></li>
+          <li><b>平常的站姿與坐姿</b><span>自動對齊的目標，坐姿可略過</span></li>
+        </ol>
+        <p class="body muted">每一步都有姿勢圖。按「下一步」或長按左手 Y／B，嗶聲結束前保持不動。要先開始追蹤。</p>
+        <button class="primary" data-flow="wizard">開始校正精靈</button>
+      </div>
+      <div class="card mt">
+        <div class="card-h"><h2>腳的朝向校正</h2><span class="hint">腳伸直往前，畫面上卻偏向一邊時</span></div>
+        <div class="aim-row">
+          <div class="aim-pic" id="aim-pic"></div>
+          <div>
+            <p class="body">面向正前方，把<b>一隻腳伸直往正前方伸出去</b>，膝蓋打直，按下後保持到嗶聲結束。左右腳各做一次。</p>
+            <p class="body muted">結果會記住，完整重置不會蓋掉它。</p>
+            <button class="primary" data-action="aim" data-delay="5">校正伸出去的那隻腳</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 感測器測試 -->
+    <section class="page" id="page-sensors">
+      <div class="sens-bar card">
+        <div class="sens-ctl">
+          <button class="primary small" id="sens-start">開始測試</button>
+          <button class="secondary small" id="sens-stop" hidden>停止</button>
+          <button class="secondary small" id="sens-zero" title="把耳機柄朝下、正面朝前拿好再按">歸零方向</button>
+          <button class="ghost small" id="sens-sim">看模擬資料</button>
+        </div>
+        <div class="sens-mode muted" id="sens-mode">尚未開始</div>
+      </div>
+      <div class="sens-help muted" id="sens-help">
+        先關掉 iPhone 的藍牙。<b>①</b> 耳機拿出盒子，按「開始測試」　<b>②</b> 轉動其中一顆，看哪張卡片在動　<b>③</b> 把耳機從耳朵拿下不放回盒子，看是否還在傳送。
+      </div>
+      <div id="sens-buds" class="sens-buds"></div>
+      <div class="card sens-log-card">
+        <div class="card-h"><h2>事件</h2><span class="muted small-t" id="sens-links"></span></div>
+        <ul class="sens-log" id="sens-log"><li class="muted">開始測試後顯示連線、入耳偵測、耳機柄等事件</li></ul>
+      </div>
+    </section>
+
+    <!-- 設定 -->
+    <section class="page" id="page-settings">
+      <div class="grid g-2" id="settings"></div>
+      <div class="savehint muted" id="savehint"></div>
+    </section>
+
+    <!-- 進階 -->
+    <section class="page" id="page-advanced">
+      <div class="grid g-2">
+        <div class="card">
+          <div class="card-h"><h2>工具</h2></div>
+          <div class="btn-list">
+            <button class="secondary" data-flow="pair">配對 AirPods</button>
+            <button class="secondary" data-flow="dongle">準備藍芽</button>
+            <button class="secondary" data-flow="vmt">虛擬追蹤器 VMT</button>
+            <button class="secondary" data-flow="model">姿勢模型</button>
+            <button class="secondary" data-flow="slimevr">SlimeVR 說明</button>
+            <button class="secondary" id="btn-diag">硬體驗證</button>
+            <button class="secondary" id="btn-diagzip" title="紀錄、設定、校正與版本資訊打包成一個 zip，回報問題時附上">匯出診斷包</button>
+            <button class="secondary" id="btn-folder">開啟資料夾</button>
+            <button class="danger-ghost" data-flow="restore">把藍芽還給 Windows</button>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-h"><h2>關於與授權</h2></div>
+          <p class="muted model-credit" id="model-credit"></p>
+          <pre class="notice" id="notice" data-notr></pre>
+        </div>
+      </div>
+      <div class="card mt">
+        <div class="card-h"><h2>紀錄</h2><button class="ghost small" id="btn-clearlog">清除畫面</button></div>
+        <div class="log" id="log"></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<div class="countdown" id="countdown" hidden><b></b><span>擺好姿勢，保持不動。再按一次可取消</span></div>
+
+<div class="modal" id="modal" hidden>
+  <div class="dialog">
+    <div class="dlg-h"><h3 id="dlg-title"></h3><span class="pill step" id="dlg-step"></span></div>
+    <div class="dlg-body">
+      <div class="spinner" id="dlg-spin" hidden></div>
+      <div class="dlg-pic" id="dlg-pic" hidden></div>
+      <p id="dlg-text"></p>
+      <ul class="choices" id="dlg-items" hidden></ul>
+      <div id="dlg-buds" hidden></div>
+    </div>
+    <div class="dlg-btns" id="dlg-btns"></div>
+  </div>
+</div>
+<div class="modal" id="ask" hidden>
+  <div class="dialog">
+    <div class="dlg-h"><h3 id="ask-title"></h3></div>
+    <div class="dlg-body"><p id="ask-text"></p></div>
+    <div class="dlg-btns"><button class="secondary" id="ask-no">取消</button><button class="primary" id="ask-yes"></button></div>
+  </div>
+</div>
+<script src="poses.js"></script>
+<script src="app.js"></script>
+  <script src="budmesh_a3.js"></script>
+  <script src="budmesh_a3L.js"></script>
+  <script src="budmesh_pro.js"></script>
+  <script src="budmesh_proL.js"></script>
+  <script src="budmodel.js"></script>
+  <script src="sensors.js"></script>
+</body>
+</html>

@@ -1,0 +1,129 @@
+FBT Pods — AirPods leg trackers for SteamVR / VRChat
+Personal project, non-commercial.
+
+This product is a derivative work of MousePods:
+  MousePods
+  Copyright 2026 Matteo Gaudioso (starman-tech) — https://github.com/starman-tech/mousepods
+  This product includes software and research developed by Matteo Gaudioso:
+  the first public documentation of how AirPods (3rd generation) expose their
+  motion sensors through Apple RemoteHID (HID over AACP).
+  Source code: Apache License 2.0. Documentation, findings, captures: CC BY 4.0.
+
+Modified / derived files (Apache-2.0 §4(b)):
+  airpodsvr/protocol.py        from airpods_mouse_controller.py and gestures.py (protocol layer,
+                               raw IMU parsing) — rewritten as a transport-independent module,
+                               side-aware addressing, timestamp-window accel/gyro pairing,
+                               SensorDataWX start packets and 58-byte motion block parsing.
+  airpodsvr/transport/bluez.py from l2cap.py — simplified.
+  tests/data/airpods3_raw_imu.json, tests/data/airpods3_motion.json
+                               = MousePods captures/airpods3_glide_raw2.json and
+                               captures/airpods3_motion_capture.json, unchanged,
+                               CC BY 4.0, "MousePods by Matteo Gaudioso (starman-tech)".
+All other files are new.
+
+Bluetooth adapter firmware (firmware/, unmodified, from linux-firmware 20240318; loaded into the
+adapter by Bumble's Realtek / Intel drivers and by airpodsvr/transport/btfw.py):
+  Realtek rtl_bt/*    — Copyright Realtek Semiconductor Corporation — redistributable,
+    see firmware/realtek/LICENCE.txt ("Redistributable-rtlwifi_firmware")
+  Intel ibt-*         — Copyright Intel Corporation — redistributable,
+    see firmware/intel/LICENCE.txt ("Redistributable-ibt_firmware")
+  MediaTek mediatek/* — Copyright MediaTek Inc. — redistributable for use with MediaTek chipsets,
+    see firmware/mediatek/LICENCE.txt ("Redistributable-mediatek")
+  Qualcomm qca/*      — Copyright Qualcomm Atheros, Inc. — redistributable,
+    see firmware/qca/LICENCE.txt ("Redistributable-QualcommAtheros_ath10k")
+
+airpodsvr/transport/btfw.py (firmware loaders for Intel legacy, MediaTek and Qualcomm USB chips) is
+an independent implementation of the bring-up protocols used by the Linux kernel drivers:
+  btmtk.c — SPDX ISC, Copyright (C) 2021 MediaTek Inc. (MediaTek WMT protocol: the procedure was
+    followed closely; ISC permission notice: "Permission to use, copy, modify, and/or distribute
+    this software for any purpose with or without fee is hereby granted, provided that the above
+    copyright notice and this permission notice appear in all copies.")
+  btintel.c, btusb.c (GPL-2.0) — consulted for command opcodes, structure layouts, firmware file
+    names and the order of steps only; no code copied.
+  airpodsvr/transport/btfw_ids.py lists USB ids from the btusb device table (hardware facts).
+
+Bundled in the Windows installer (unmodified, under their own licences):
+  Virtual Motion Tracker (VMT) by gpsnmeajp — MIT — https://github.com/gpsnmeajp/VirtualMotionTracker
+  wdi-simple from libwdi by Pete Batard — GNU LGPL v3 — https://github.com/pbatard/libwdi
+    (used only to switch the dedicated USB Bluetooth dongle to WinUSB; source at the link above)
+
+Third-party Python components (installed as dependencies):
+  vqf (MIT), Bumble (Apache-2.0), pyopenvr (BSD-3), python-osc (Unlicense),
+  ONNX Runtime (MIT), PyTorch (BSD-3, training only),
+  pywebview (BSD-3, app window; includes the Microsoft WebView2 SDK DLLs under Microsoft's
+  WebView2 SDK licence), pythonnet (MIT), clr_loader (MIT), cffi (MIT), pycparser (BSD-3),
+  bottle (MIT), proxy_tools (BSD), typing_extensions (PSF), pystray (LGPL-3.0, tray icon,
+  unmodified), Pillow (MIT-CMU), six (MIT),
+  Virtual Motion Tracker by gpsnmeajp (MIT, SteamVR driver).
+AirPointer — Copyright (c) 2026 Oscar Nicholas, MIT License —
+  https://github.com/oscarcreatess/airpointer : SensorDataWX raw accelerometer / gyroscope service
+  numbers (11 / 12), report layout and scale, sequence-number handling, and the observations that
+  AirPods also connected to an iPhone send no motion and that motion answers right after a connection.
+  (Protocol facts re-implemented in airpodsvr/protocol.py and link.py; no code copied.)
+
+SlimeVR-style legs (airpodsvr/slimelegs.py) — a DERIVATIVE WORK of SlimeVR-Server
+  https://github.com/SlimeVR/SlimeVR-Server (read at commit 83941fd, server v21.1.0), licensed
+  MIT OR Apache-2.0 and used here under the MIT licence below. Ported from Kotlin to Python and
+  adapted (see the list of changes at the top of the file):
+    filtering/QuaternionMovingAverage.kt            the "prediction" rotation filter
+    tracking/processor/skeleton/HumanSkeleton.kt    the extended knee model (extendedKneeYawRoll)
+    tracking/processor/Constraint.kt                the leg's joint limits
+    tracking/processor/skeleton/LegTweaks.kt        floor clip, skating correction, foot plant
+    tracking/processor/skeleton/LegTweaksBuffer.kt  foot lock detection
+  Used when the "Leg solver" setting is "SlimeVR-style (fallback)". The hip estimate is FBT Pods' own.
+
+    MIT License
+
+    Copyright (c) 2020 Eiren Rain and SlimeVR Contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+SlimeVR Server output (airpodsvr/slimeout.py): speaks the UDP protocol of the SlimeVR tracker
+  firmware so that a SlimeVR Server the user installed can do the body. Written from the protocol as
+  implemented in SlimeVR-Server (MIT OR Apache-2.0); this file contains no SlimeVR code.
+  SlimeVR is a trademark of SlimeVR B.V. FBT Pods is not affiliated with or endorsed by SlimeVR B.V.
+
+Design references (ideas re-implemented, no code copied):
+  SlimeVR Server — Copyright SlimeVR contributors, MIT OR Apache-2.0 —
+    https://github.com/SlimeVR/SlimeVR-Server : reset types, "Stay Aligned" yaw correction
+    (rest detection, relaxed-pose targets), LegTweaks floor clip and skating correction.
+HMD-Poser — Copyright (c) 2024 Pico-AI-Team, MIT licence — https://github.com/Pico-AI-Team/HMD-Poser :
+  airpodsvr/hmdposer.py is a NumPy re-implementation of its network and input features so its
+  published checkpoint can be run without PyTorch. The checkpoint is NOT shipped: the user downloads
+  it from the HMD-Poser repository (Advanced -> pose model). It was trained on AMASS, so it is for
+  non-commercial research use only and must not be redistributed.
+Training data (if you train the pose model): AMASS and SMPL+H, non-commercial research
+  licences; model weights trained on them must not be redistributed or used commercially.
+
+Not affiliated with Apple Inc. AirPods is a trademark of Apple Inc.
+
+3D model of the earbud (airpodsvr/web/budmesh_a3.js, budmesh_a3L.js)
+  "AirPods 4" by Falah3D (https://sketchfab.com/3dFalah),
+  https://sketchfab.com/3d-models/airpods-4-e44730974131402eb496352cab19c82e
+  licensed under Creative Commons Attribution 4.0 (https://creativecommons.org/licenses/by/4.0/).
+  Changes: one bud taken out of the scene, reduced to about 5000 triangles, textures dropped,
+  converted to a JavaScript data file (packaging/bake_bud_model.py).
+
+3D model of the earbud with silicone tips (airpodsvr/web/budmesh_pro.js)
+  Supplied by the project owner as "airpods-pro.zip" (Blender file airpods3.blend); by Falah3D
+  (https://sketchfab.com/3dFalah), the author of the AirPods 4 model above, according to the
+  project owner. The model's own page and licence have not been checked against this entry: add
+  its URL and licence here before publishing.
+  Changes: one bud taken out of the scene, reduced to about 5000 triangles, textures dropped;
+  budmesh_pro.js is the mirror image (the other ear).

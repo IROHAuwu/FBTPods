@@ -1,0 +1,25 @@
+1 ICON "icon.ico"
+1 VERSIONINFO
+FILEVERSION 0,3,8,0
+PRODUCTVERSION 0,3,8,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040404B0"
+    BEGIN
+      VALUE "CompanyName", "FBT Pods (personal project)"
+      VALUE "FileDescription", "FBT Pods"
+      VALUE "FileVersion", "0.3.8"
+      VALUE "InternalName", "FBTPods"
+      VALUE "OriginalFilename", "FBTPods.exe"
+      VALUE "ProductName", "FBT Pods"
+      VALUE "ProductVersion", "0.3.8"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0404, 1200
+  END
+END

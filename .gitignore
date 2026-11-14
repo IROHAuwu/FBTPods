@@ -1,0 +1,17 @@
+# local data / environments
+.venv/
+/data/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.tmp
+# build outputs (portable zip / installer go to GitHub Releases, not the repo)
+dist/
+build/
+*.zip
+# trained models (AMASS-derived weights must not be redistributed)
+models/*.pt
+models/*.onnx
+training/data/
+# written while packaging (version + commit)
+/build_info.json

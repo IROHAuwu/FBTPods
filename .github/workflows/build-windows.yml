@@ -1,0 +1,131 @@
+# Builds, on a GitHub-hosted Windows machine:
+#   FBTPods-portable.zip          the no-install folder (launcher compiled here from launcher.c)
+#   FBTPods-Setup-<version>.exe   the installer
+# Push to GitHub, then: Actions -> "Build Windows installer" -> Run workflow.
+# A release named FBT_Pods_<tag> is published from a pushed tag v*, from the tag typed into
+# "Run workflow", or when packaging/RELEASE (the tag, e.g. v1) changes on main.
+name: Build Windows installer
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: "Publish as a release with this tag (for example v1); empty = build only"
+        required: false
+        default: ""
+  push:
+    tags: ["v*"]
+    branches: [main]
+    paths: ["packaging/RELEASE"]      # holds the tag to publish, e.g. v1
+
+jobs:
+  portable:
+    runs-on: windows-latest
+    permissions:
+      contents: write          # a tag publishes the zip as a release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r packaging/requirements.txt -c packaging/constraints.txt pytest ziglang
+
+      - name: Tests (no hardware)
+        run: python -m pytest -q tests
+
+      - name: Portable folder (pinned packages, launcher built from source)
+        run: python packaging/build_portable.py --build-launcher
+
+      - name: The bundled Python can import the app and every package
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = ""
+          & dist\FBTPods\runtime\python.exe -c "import sys; sys.path.insert(0, r'dist\FBTPods\app'); import airpodsvr, numpy, bumble, vqf, openvr, pythonosc, webview, pystray; from airpodsvr.version import text; print(text())"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FBTPods-portable
+          path: |
+            dist/FBTPods-portable.zip
+            dist/FBTPods-versions.txt
+
+      # release "FBT_Pods_<tag>" with FBT_Pods_<tag>.zip: from a pushed tag, from the tag typed into
+      # "Run workflow", or from packaging/RELEASE when that file changes on main
+      - name: Publish the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASKED: ${{ github.event.inputs.release }}
+        run: |
+          $tag = ""
+          if ($env:GITHUB_REF_TYPE -eq "tag") { $tag = $env:GITHUB_REF_NAME }
+          elseif ($env:ASKED) { $tag = $env:ASKED.Trim() }
+          elseif ($env:GITHUB_EVENT_NAME -eq "push") { $tag = (Get-Content packaging\RELEASE -Raw).Trim() }
+          if (-not $tag) { Write-Host "no release asked for"; exit 0 }
+          if ($tag -notmatch '^v[0-9][0-9A-Za-z.\-]*$') { Write-Host "not a release tag: $tag"; exit 1 }
+          gh release view $tag --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { Write-Host "release $tag exists already"; exit 0 }
+          $name = "FBT_Pods_$tag"
+          Copy-Item dist\FBTPods-portable.zip "dist\$name.zip"
+          $notes = "Windows portable build: download $name.zip, unzip the whole folder and run FBTPods.exe.`n`nInterface: English (default), Traditional Chinese, Japanese, Korean (Settings > Language).`n`nSetup: https://github.com/$env:GITHUB_REPOSITORY#readme"
+          gh release create $tag "dist\$name.zip" --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title $name --notes $notes
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r packaging/requirements.txt -c packaging/constraints.txt pyinstaller pytest
+          python -m pip install --no-deps capablerobot-usbregister==1.3.1.2
+
+      - name: Build information (version, commit) shown in the window
+        run: python -c "import sys; sys.path.insert(0, 'packaging'); import build_portable as b; print(b.write_build_file(b.ROOT))"
+
+      - name: Tests (no hardware)
+        run: python -m pytest -q tests
+
+      - name: Bundle wdi-simple (libwdi, LGPL) for the one-click WinUSB step
+        shell: pwsh
+        run: |
+          $pkg = python -c "import importlib.util,os;print(os.path.dirname(importlib.util.find_spec('capablerobot_usbregister').origin))"
+          New-Item -ItemType Directory -Force tools | Out-Null
+          Copy-Item "$pkg\binaries\wdi-64bit.exe" tools\wdi-simple.exe
+          "wdi-simple.exe: libwdi example program, Copyright Pete Batard, GNU LGPL v3, unmodified. https://github.com/pbatard/libwdi" | Out-File tools\README.txt -Encoding utf8
+
+      # VMT is not bundled: the app downloads the pinned release (winsetup.VMT_TAG) and checks its
+      # SHA-256 before running it. (This step used to fetch "the latest release zip", which VMT has
+      # not published since it moved to an installer, so the job always failed here.)
+
+      - name: Chinese installer language
+        shell: pwsh
+        run: |
+          try { Invoke-WebRequest https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/Unofficial/ChineseTraditional.isl -OutFile packaging\ChineseTraditional.isl } catch { Write-Host "skip" }
+
+      - name: PyInstaller
+        run: pyinstaller packaging/FBTPods.spec --noconfirm
+
+      - name: Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
+          $ver = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME.TrimStart("v") } else { "0.1.0" }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$ver" packaging\installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FBTPods-Setup
+          path: dist/FBTPods-Setup-*.exe
