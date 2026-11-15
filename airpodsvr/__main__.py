@@ -53,8 +53,15 @@ def main(argv=None):
     _log_unhandled()
 
     if a.cmd == "gui":
+        autostart = getattr(a, "autostart", False)
+        if autostart and not cfg.get("auto_launch_with_steamvr", True):
+            # SteamVR keeps its own copy of this setting and hears of the change only when tracking
+            # next connects to it: until then it still starts us. The user said not to, so nothing
+            # is done (no tracking, no Bluetooth adapter taken, no hand-over to an open window).
+            logging.getLogger(__name__).info("started by SteamVR, but starting with SteamVR is switched off")
+            return
         from .webui import main as ui_main
-        ui_main(autostart=getattr(a, "autostart", False))
+        ui_main(autostart=autostart)
     elif a.cmd == "demo":
         from .app import App
         App(demo=True).run()
@@ -129,6 +136,8 @@ def _replay(path):
             s = ev[1]
             f = fus.setdefault(s.side, BudFusion())
             R = f.update_fused(s.ts_ns, s.quat, s.gyr) if s.quat is not None else f.update(s.ts_ns, s.acc, s.gyr)
+            if R is None:                    # an attitude that is not a number: refused, nothing to print
+                continue
             n += 1
             if n % 50 == 0:
                 print(f"t={t:8.2f} side={s.side} heading={math.degrees(heading_of(R)):7.1f}° "

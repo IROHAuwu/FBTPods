@@ -19,7 +19,15 @@ datas = [
 ]
 for opt in ("models", "tools", "vmt"):
     p = os.path.join(ROOT, opt)
-    if os.path.isdir(p):
+    if not os.path.isdir(p):
+        continue
+    if opt == "models":
+        # never the weights: pose.pt / pose.onnx are trained on AMASS (its licence forbids passing
+        # them on) and the HMD-Poser checkpoint is downloaded by the app when the user asks for it
+        for f in sorted(os.listdir(p)):
+            if os.path.isfile(os.path.join(p, f)) and not f.lower().endswith((".pt", ".onnx")):
+                datas.append((os.path.join(p, f), opt))
+    else:
         datas.append((p, opt))
 if os.path.isfile(os.path.join(ROOT, "build_info.json")):          # written by the build workflow
     datas.append((os.path.join(ROOT, "build_info.json"), "."))

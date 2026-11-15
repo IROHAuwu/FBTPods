@@ -94,9 +94,18 @@ class LegTracker:
         # gyro axes -> accelerometer axes, found by the self-check (axischeck.py) and kept per bud
         gm = saved.get("gyro_map") if saved.get("gyro_map_source") == source else None
         self.gyro_map = np.array(gm, float) if gm is not None else None
-        self.axis_check = None if self.gyro_map is not None else GyroAxisCheck()
+        # a bud the check found to use the accelerometer's axes is not checked again every session
+        self.axes_checked = gm is None and saved.get("axes_checked") == source
+        self.axis_check = None if self.gyro_map is not None or self.axes_checked else GyroAxisCheck()
         self.axes_fixed = False            # set when the check changed the mapping this session
-        self.fusion = BudFusion(rate_hz, bias=saved.get("gyro_bias"))
+        # The gyro bias and the learned drift rate belong to the bud, not to the place on the body:
+        # after pairing again or swapping pairs between legs, the other bud's would turn this one
+        # (a drift rate is unlearned only slowly). Files saved before the source was kept have none.
+        same_bud = saved.get("source", source) == source
+        if not same_bud:
+            log.info("%s (%s): saved gyro bias and drift rate were another bud's (%s), not used",
+                     role, source, saved.get("source"))
+        self.fusion = BudFusion(rate_hz, bias=saved.get("gyro_bias") if same_bud else None)
         self.R_sm = np.array(saved["R_sm"]) if saved.get("R_sm") else None
         # Mounting measured before the accelerometer sign was put right (protocol.ImuPairer) is
         # upside down for a raw-IMU bud: it is dropped at that bud's first raw sample. For a bud that
@@ -104,30 +113,62 @@ class LegTracker:
         self.old_mounting = self.R_sm is not None and saved.get("imu") != IMU_CONVENTION
         self.recalibrate = False           # set when that happened: the app asks for the wizard again
         self.delta = 0.0
-        self.drift_rate = float(saved.get("drift_rate", 0.0))     # rad/s, learned
+        # the part of delta turned only to keep the heading where it was through a change of the
+        # bud's heading reference (see update): the leg did not turn, nothing was corrected
+        self.heading_kept = 0.0
+        self.drift_rate = float(saved.get("drift_rate", 0.0)) if same_bud else 0.0     # rad/s, learned
         self.last_update = 0.0
         self.last_manual_reset = None
         self.calibrated = False            # true after the first full reset of the session
 
     # ---------------------------------------------------------------- data
+    # A fused stream silent this long (or whose clock went back) started again. The link asks for the
+    # stream again once it has been silent for 2 s (link.py); shorter gaps happen while it runs (a
+    # recording in tests/data has 1.4 s in the middle of a turn) and the bud's heading goes on
+    # through them, so a turn made then must be followed, not kept out.
+    RESTART_GAP_S = 2.0
+
     def update(self, sample):
-        self.last_arrival = time.monotonic()
-        if sample.quat is not None:
+        fused = sample.quat is not None
+        # The heading reference under a bud can change: its own attitude stream starts again (and
+        # may pick a new heading), or the bud goes from that stream to raw accel / gyro or back
+        # (SensorDataWX: Pro 2 / Pro 3 / 4; two unrelated headings). The delta of the last reset
+        # would then point the leg somewhere else, by any angle, until the next reset. Instead the
+        # heading is kept where it was, as it already is for a raw bud, whose filter cannot see a
+        # turn made while no data came either.
+        h_before = heading_of(self.R_seg()) if self.fusion.n else None
+        why = None
+        if self.fusion.n and fused != self.fusion.fused:
+            why = "raw IMU -> fused attitude" if fused else "fused attitude -> raw IMU"
+        elif fused and self.fusion.n and self.fusion.last_ts is not None:
+            gap = (sample.ts_ns - self.fusion.last_ts) / 1e9
+            if gap > self.RESTART_GAP_S or gap < -0.1:
+                why = "fused stream started again (%+.1f s)" % gap
+        if fused:
             R_prev, ts_prev = self.fusion.R_ws.copy(), self.fusion.last_ts
+            if self.fusion.update_fused(sample.ts_ns, sample.quat, sample.gyr) is None:
+                return                     # not an attitude (non-finite): as if it had not come
+            self.last_arrival = time.monotonic()
             self.old_mounting = False
-            self.fusion.update_fused(sample.ts_ns, sample.quat, sample.gyr)
             self.last_acc = None
-            self._check_fused(R_prev, ts_prev, sample.ts_ns, sample.gyr)
+            if why is None:                # the attitude jump of a restart is not a rotation
+                self._check_fused(R_prev, ts_prev, sample.ts_ns, sample.gyr)
         else:
+            self.last_arrival = time.monotonic()
             if self.old_mounting:
                 self.old_mounting = False
                 self.R_sm, self.calibrated, self.recalibrate = None, False, True
                 log.warning("%s (%s): mounting calibration predates the accelerometer sign fix, dropped",
                             self.role, self.source)
+            if self.fusion.fused:
+                # back from the attitude stream: the filter's state is from before it, and would take
+                # many seconds to find gravity again; a new one finds it at its first sample
+                self.fusion = BudFusion(self.rate_hz, bias=self.fusion.bias()[0])
             prev_ts = self.fusion.last_ts
             gyr = sample.gyr
             if self.axis_check is not None and prev_ts is not None:
-                m = self.axis_check.feed((sample.ts_ns - prev_ts) / 1e9, sample.acc, sample.gyr)
+                check = self.axis_check
+                m = check.feed((sample.ts_ns - prev_ts) / 1e9, sample.acc, sample.gyr)
                 if m is not None:
                     self.axis_check = None
                     if not np.allclose(m, np.eye(3)):
@@ -137,11 +178,23 @@ class LegTracker:
                         self.axes_fixed = True
                         self.fusion = BudFusion(self.rate_hz)     # restart in the right axes
                         prev_ts = None
+                        why = why or "gyro axes corrected"
+                    else:
+                        self.axes_checked = check.sure
             if self.gyro_map is not None:
                 gyr = tuple(self.gyro_map @ np.asarray(gyr, float))
             self.fusion.update(sample.ts_ns, sample.acc, gyr)
             self.last_acc = sample.acc
             self._integrate_lift(sample.ts_ns, prev_ts, sample.acc)
+        if why is not None:
+            # the foot-lift integration only runs on raw data: a lift left over would stay for good
+            self.lift, self._v, self._still, self._landed = 0.0, 0.0, 0.0, False
+            if h_before is not None:
+                d = wrap(h_before - heading_of(self.R_seg()))
+                self.delta = wrap(self.delta + d)
+                self.heading_kept = wrap(self.heading_kept + d)
+                log.log(logging.INFO if why.startswith("fused stream") else logging.WARNING,
+                        "%s (%s): %s, heading kept (%+.1f deg)", self.role, self.source, why, math.degrees(d))
         self.last_update = time.monotonic()
 
     # ---------------------------------------------------------------- fused stream sanity
@@ -246,6 +299,15 @@ class LegTracker:
     def angular_speed(self):
         return float(np.linalg.norm(self.fusion.gyr))
 
+    def rest_speed(self):
+        """Rotation rate (rad/s) for telling that the segment is still. For a raw-IMU bud the
+        fusion's gyro-bias estimate is taken off first: a gyro reading 2 deg/s at rest would never
+        count as still otherwise. A fused bud's rate is used as it comes."""
+        g = self.fusion.gyr
+        if self.fusion.n and not self.fusion.fused:
+            g = g - np.asarray(self.fusion.bias()[0], float)
+        return float(np.linalg.norm(g))
+
     # ---------------------------------------------------------------- corrections
     def apply_yaw(self, d_rad: float):
         self.delta = wrap(self.delta + d_rad)
@@ -318,10 +380,13 @@ class LegTracker:
     def to_saved(self):
         b, _ = self.fusion.bias()
         out = {"R_sm": self.R_sm.tolist() if self.R_sm is not None else None,
-               "gyro_bias": b, "drift_rate": self.drift_rate}
+               "gyro_bias": b, "drift_rate": self.drift_rate,
+               "source": self.source}        # whose gyro bias and drift rate these are
         if not self.old_mounting:
             out["imu"] = IMU_CONVENTION
         if self.gyro_map is not None:
             out["gyro_map"] = self.gyro_map.tolist()
             out["gyro_map_source"] = self.source
+        elif self.axes_checked:
+            out["axes_checked"] = self.source
         return out

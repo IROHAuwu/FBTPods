@@ -18,8 +18,13 @@ def errtext(e) -> str:
 def forgot_us(e) -> bool:
     """The AirPods no longer have the key of our bond (they were reset, or paired again from their
     case): authentication with the key we kept fails with "PIN or key missing". Only pairing again
-    helps, and only while they are in pairing mode."""
-    return "PIN_OR_KEY_MISSING" in str(e) or getattr(e, "error_code", None) == 0x06
+    helps, and only while they are in pairing mode.
+
+    The bare code 6 counts only from the HCI layer (namespace "hci", or "HCI_..._COMMAND" for a
+    command status): other layers number their errors on their own, and L2CAP's 6 is "invalid
+    source CID", a refused channel that has nothing to do with the bond."""
+    ns = str(getattr(e, "error_namespace", "") or "").lower()
+    return "PIN_OR_KEY_MISSING" in str(e) or (getattr(e, "error_code", None) == 0x06 and ns.startswith("hci"))
 
 
 class Channel:

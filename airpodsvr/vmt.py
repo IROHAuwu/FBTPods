@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 REPLY_PORT = 39571            # where the driver sends /VMT/Out/Alive (and where VMT Manager listens)
 ALIVE_WAIT = 10.0             # no answer this long after the first pose: the driver is not running
 LISTEN_FOR = 60.0             # then the port is given back (VMT Manager cannot start while it is taken)
+SKIP_LOG_S = 10.0             # a pose that could not be sent is logged at most this often per tracker
 
 
 class VmtOutput:
@@ -30,6 +31,10 @@ class VmtOutput:
     def __init__(self, host="127.0.0.1", port=39570, indices=None, mode=1, reply_port=REPLY_PORT,
                  space="room"):
         from pythonosc.udp_client import SimpleUDPClient
+        if isinstance(host, str) and host.strip().lower() == "localhost":
+            # python-osc sends to the first address Windows gives for "localhost": ::1 (IPv6). VMT
+            # listens on 127.0.0.1 only, so every pose went nowhere and no tracker ever appeared.
+            host = "127.0.0.1"
         self.client = SimpleUDPClient(host, port)
         self.alive = None
         self.reply_port = reply_port if host in ("127.0.0.1", "localhost") else None
@@ -46,9 +51,18 @@ class VmtOutput:
         self.space = space if space in ("room", "raw") else "room"
         self.address = "/VMT/Room/Driver" if self.space == "room" else "/VMT/Raw/Driver"
         self._room_t = None
+        self._skipped = {}         # name -> (poses not sent, when that was last logged)
 
     def send(self, name, R, p, enable=True):
+        """Returns False when the pose was not sent: not finite (NaN or inf from a numeric corner
+        case upstream). VMT then keeps showing the last good one; sent, it would put the tracker
+        nowhere, or break it in SteamVR."""
         idx = self.indices[name]
+        R, p = np.asarray(R, float), np.asarray(p, float)
+        q = mat_to_quat(R) if np.all(np.isfinite(R)) else None      # w, x, y, z
+        if q is None or not (np.all(np.isfinite(q)) and np.all(np.isfinite(p))):
+            self._skip(name)
+            return False
         if enable:
             self.sent.add(name)
             if self._t0 is None:
@@ -58,11 +72,19 @@ class VmtOutput:
             if self._room_t is None or now - self._room_t > 5.0:   # again now and then: VMT may restart
                 self._room_t = now
                 self.set_room_identity()
-        q = mat_to_quat(R)         # w, x, y, z
         self.client.send_message(self.address, [
             int(idx), int(self.mode if enable else 0), 0.0,
             float(p[0]), float(p[1]), float(p[2]),
             float(q[1]), float(q[2]), float(q[3]), float(q[0])])
+        return True
+
+    def _skip(self, name):
+        n, t = self._skipped.get(name, (0, -1e9))
+        now = time.monotonic()
+        if now - t >= SKIP_LOG_S:
+            log.warning("VMT %s: pose not finite, not sent (%d so far); the last good one stays", name, n + 1)
+            t = now
+        self._skipped[name] = (n + 1, t)
 
     def set_room_identity(self):
         """Temporary (not saved) room matrix = identity. Both spellings VMT accepts."""

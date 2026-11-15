@@ -115,7 +115,11 @@ class HipEstimator:
             nxz = neck[[0, 2]]
             self.upright_neck = nxz if self.upright_neck is None else \
                 self.upright_neck + (nxz - self.upright_neck) * (1.0 - math.exp(-dt / 0.3))
-        if w > 0 and self.upright_neck is not None:
+        if w > 0 and self.upright_neck is None:
+            # not seen standing yet (a session started in the chair): bending cannot be told from
+            # looking down at the lap, and seated the lap is by far the likelier
+            w = 0.0
+        if w > 0:
             fwd_h = rot_y(self.heading)[:, 2] * -1.0
             ahead = float((neck[[0, 2]] - self.upright_neck) @ fwd_h[[0, 2]])
             w *= min(1.0, max(0.0, (ahead - 0.08) / 0.20))
@@ -131,6 +135,19 @@ class HipEstimator:
         hip = neck - b.torso * R_hip[:, 1]
         if R_pelvis is None:
             hip, R_hip = self._lie_down(R_hmd, neck, hip, R_hip, dt)
+        else:
+            # the waist bud measures the torso's tilt itself: "lying" is read from it the same way as
+            # below (torso 20 .. 49 degrees over; it gates the pose model), and however the bud is
+            # tipped the hip stays on the floor. As below, only as far as the head is low enough for
+            # that tilt: bending forward, or leaning back in a chair, tips the waist just as much
+            # and is not lying (the pose model is asked then, as it always was with a waist bud).
+            t = float(np.linalg.norm(R_pelvis[[0, 2], 1]))
+            c = min(1.0, max(-1.0, (neck[1] - b.lying_hip_y) / max(b.torso, 0.3)))
+            t = min(t, math.sqrt(1.0 - c * c))
+            self.lying = min(1.0, max(0.0, (t - 0.35) / 0.40))
+            if hip[1] < b.lying_hip_y:
+                hip = hip.copy()
+                hip[1] = b.lying_hip_y
         if hip[1] > b.standing_hip_y:          # legs cannot be longer than they are
             hip = hip.copy()
             hip[1] = b.standing_hip_y

@@ -8,8 +8,11 @@ tracking is stopped (or on "結束").
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
+import math
 import mimetypes
 import os
 import secrets
@@ -30,22 +33,81 @@ PORT = 38741
 PORT_TRIES = 10               # PORT .. PORT+9: another program may already use the first one
 APP_ID = "FBTPods"            # what /api/ping answers, so an instance is told from a stranger
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+# the types of the files we ship, fixed: Windows lets installed programs change what the registry
+# says (".css" as text/plain is a known case), and the window then refused the stylesheet
+MIME = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".ico": "image/x-icon",
+        ".json": "application/json", ".svg": "image/svg+xml", ".png": "image/png"}
+MUTEX = "Local\\FBTPods-"     # + the data folder: held by the running FBT Pods (see _claim_instance)
+HANDOVER_WAIT = 20.0          # seconds a second launch waits for the first one to answer
+_instance = None              # our handle on MUTEX, kept open until the process ends
+ANOTHER_COPY = "另一份 FBT Pods 已經在執行。請點右下角的 FBT Pods 圖示開啟它，或在那裡結束它之後再開啟這一份。"
 
 
 def _token():
     os.makedirs(C.DATA, exist_ok=True)
     p = os.path.join(C.DATA, "ui_token")
-    try:
-        with open(p, encoding="utf-8") as f:
-            t = f.read().strip()
-            if len(t) >= 16:
-                return t
-    except OSError:
-        pass
+    t = _read_token()
+    if t:
+        return t
     t = secrets.token_urlsafe(24)
-    with open(p, "w", encoding="utf-8") as f:
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(t)
+    os.replace(tmp, p)        # whole or not at all: a second launch may be reading it right now
     return t
+
+
+def _read_token():
+    """The token of this install, or None while there is none yet (only the running instance makes it)."""
+    try:
+        with open(os.path.join(C.DATA, "ui_token"), encoding="utf-8") as f:
+            t = f.read().strip()
+    except OSError:
+        return None
+    return t if len(t) >= 16 else None
+
+
+def _proof(token, port, nonce):
+    """What /api/ping answers to show it holds `token`, without giving the token away. The port is
+    part of it, so a program on another port cannot pass on a real instance's answer as its own."""
+    return hmac.new(token.encode("utf-8"), f"{APP_ID} {port} {nonce}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _finite(o):
+    """`o` with every NaN and infinity made None. JSON has no such numbers: one of them anywhere in
+    the state made the window's JSON.parse fail, and it said "connection lost" while it lasted."""
+    if isinstance(o, float):
+        return o if math.isfinite(o) else None
+    if isinstance(o, dict):
+        return {k: _finite(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_finite(v) for v in o]
+    if hasattr(o, "tolist"):                 # numpy numbers and arrays
+        return _finite(o.tolist())
+    return o
+
+
+def _json_default(o):
+    if hasattr(o, "tolist"):                 # numpy numbers and arrays
+        return o.tolist()
+    raise TypeError(f"{type(o).__name__} is not JSON serializable")
+
+
+def dumps(obj):
+    """JSON text for the window: never NaN or Infinity (see _finite)."""
+    try:
+        return json.dumps(obj, ensure_ascii=False, allow_nan=False, default=_json_default)
+    except ValueError:
+        return json.dumps(_finite(obj), ensure_ascii=False, allow_nan=False, default=_json_default)
+
+
+def _takes(fn, name):
+    """`fn` has a parameter called `name`."""
+    import inspect
+    try:
+        return name in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 def find_browser():
@@ -94,8 +156,17 @@ class Server:
             def log_message(self, *a):
                 pass
 
+            def end_headers(self):
+                # never shown inside another page, and a file is only ever what its type says
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("X-Frame-Options", "DENY")
+                self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+                # the window's address carries the access token: never pass it on to another site
+                self.send_header("Referrer-Policy", "no-referrer")
+                super().end_headers()
+
             def _json(self, obj, code=200):
-                data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                data = dumps(obj).encode("utf-8")
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Cache-Control", "no-store")
@@ -105,6 +176,17 @@ class Server:
 
             def _authorized(self):
                 return secrets.compare_digest(self.headers.get("X-Token", ""), srv.token)
+
+            def _host_ok(self):
+                """Asked for by name as 127.0.0.1 or localhost on our port. A web page that points a
+                name of its own at 127.0.0.1 (DNS rebinding) sends that name: it is refused, so it
+                cannot even read /api/ping or the texts."""
+                host = (self.headers.get("Host") or "").strip().lower()
+                port = self.server.server_address[1]
+                return host in (f"127.0.0.1:{port}", f"localhost:{port}")
+
+            def _refuse_host(self):
+                self._json({"error": "forbidden"}, 403)
 
             def _body(self):
                 n = int(self.headers.get("Content-Length", "0") or 0)
@@ -116,9 +198,19 @@ class Server:
                     return {}
 
             def do_GET(self):
+                if not self._host_ok():
+                    return self._refuse_host()
                 u = urlparse(self.path)
                 if u.path == "/api/ping":            # no token: only says who is listening here
-                    return self._json({"app": APP_ID})
+                    if srv.quit.is_set():
+                        # on the way out: a launch now must wait for us to end and start for real,
+                        # not hand its window over to us (it was never shown)
+                        return self._json({"error": "quitting"}, 503)
+                    out = {"app": APP_ID}
+                    nonce = parse_qs(u.query).get("nonce", [""])[0]
+                    if 0 < len(nonce) <= 64:         # and, asked, proves it holds the token
+                        out["proof"] = _proof(srv.token, srv.port, nonce)
+                    return self._json(out)
                 if u.path.startswith("/api/"):
                     if not self._authorized():
                         return self._json({"error": "forbidden"}, 403)
@@ -141,9 +233,15 @@ class Server:
                     return self._json({"error": "not found"}, 404)
                 if u.path == "/i18n-data.js":        # the chosen language and its texts, for i18n.js
                     from . import i18n
-                    lang = i18n.code()
-                    data = ("window.FBT_I18N=" + json.dumps({"lang": lang, "dict": i18n.table(lang)[0]},
-                                                           ensure_ascii=False) + ";").encode("utf-8")
+                    try:
+                        lang = i18n.code()
+                        d = {"lang": lang, "dict": i18n.table(lang)[0]}
+                        if not d["dict"]:            # no texts for it (yet): the page as written
+                            d = {"lang": "zh", "dict": {}}
+                    except Exception:   # noqa: BLE001 - the page in its own wording beats no page
+                        log.exception("interface language")
+                        d = {"lang": "zh", "dict": {}}
+                    data = ("window.FBT_I18N=" + json.dumps(d, ensure_ascii=False) + ";").encode("utf-8")
                     self.send_response(200)
                     self.send_header("Content-Type", "text/javascript; charset=utf-8")
                     self.send_header("Cache-Control", "no-store")
@@ -160,7 +258,8 @@ class Server:
                 with open(path, "rb") as f:
                     data = f.read()
                 self.send_response(200)
-                ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
+                ctype = (MIME.get(os.path.splitext(path)[1].lower()) or mimetypes.guess_type(path)[0]
+                         or "application/octet-stream")
                 if ctype.startswith("text/") or ctype.endswith("javascript"):
                     ctype += "; charset=utf-8"
                 self.send_header("Content-Type", ctype)
@@ -170,6 +269,8 @@ class Server:
                 self.wfile.write(data)
 
             def do_POST(self):
+                if not self._host_ok():
+                    return self._refuse_host()
                 if not self._authorized():
                     return self._json({"error": "forbidden"}, 403)
                 srv.last_seen = time.monotonic()
@@ -195,7 +296,11 @@ class Server:
                     elif p == "/api/flow/start":
                         return self._json(ctl.start_flow(b.get("kind", "")))
                     elif p == "/api/flow/answer":
-                        ctl.answer_flow(b.get("id"), b.get("value"), b.get("choice"))
+                        # "shown": which showing of the step the window answers (app.js sends it when
+                        # the step has it), so an answer to a step that was shown again is not taken
+                        # for an answer to the new one; passed on when the controller checks it
+                        more = {"shown": b["shown"]} if "shown" in b and _takes(ctl.answer_flow, "shown") else {}
+                        ctl.answer_flow(b.get("id"), b.get("value"), b.get("choice"), **more)
                     elif p == "/api/folder":
                         ctl.open_data_folder()
                     elif p == "/api/diagnostics":
@@ -209,9 +314,9 @@ class Server:
                     elif p == "/api/sensors/name":
                         ctl.monitor.set_name(str(b.get("src", "")), str(b.get("name", "")))
                     elif p == "/api/show":
+                        # only the signal: the native window's watcher or main()'s loop opens the
+                        # window (opening one here as well gave two browser windows per launch)
                         srv.show_request.set()
-                        if not srv.native:
-                            open_window(srv.url())
                     elif p == "/api/quit":
                         srv.quit.set()
                     else:
@@ -251,13 +356,42 @@ def port_in_use(port=PORT):
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
-def _is_fbtpods(port, timeout=1.0):
+def _local(req, timeout):
+    """urllib for our own 127.0.0.1, never through a proxy: urllib follows HTTP_PROXY and the
+    Windows proxy setting, and a proxy that is closed or refuses loopback made a running FBT Pods
+    look absent (a second one started) and was handed the token."""
     import urllib.request
+    return urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=timeout)
+
+
+def _ping(port, nonce=None, timeout=1.0):
+    """What /api/ping on `port` answers (a dict), or None: nothing there, or not FBT Pods."""
+    url = f"http://127.0.0.1:{port}/api/ping" + (f"?nonce={nonce}" if nonce else "")
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/ping", timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8")).get("app") == APP_ID
+        with _local(url, timeout) as r:
+            d = json.loads(r.read().decode("utf-8"))
     except Exception:   # noqa: BLE001 - nothing there, or something that is not us
-        return False
+        return None
+    return d if isinstance(d, dict) and d.get("app") == APP_ID else None
+
+
+def _is_fbtpods(port, timeout=1.0):
+    return _ping(port, timeout=timeout) is not None
+
+
+def _who(port, token):
+    """The FBT Pods on `port`: "ours" (it proves it holds our token), "other" (another copy, with a
+    data folder and token of its own), "old" (a version that cannot prove it), or None (no FBT Pods).
+    Our token is only ever sent to "ours"."""
+    nonce = secrets.token_hex(16)
+    d = _ping(port, nonce)
+    if d is None:
+        return None
+    proof = d.get("proof")
+    if not isinstance(proof, str):
+        return "old"
+    ok = bool(token) and hmac.compare_digest(proof.encode("utf-8"), _proof(token, port, nonce).encode("utf-8"))
+    return "ours" if ok else "other"
 
 
 def find_instance():
@@ -274,7 +408,7 @@ def _ask_running_instance(token, what="show", timeout=3, port=PORT):
     try:
         req = urllib.request.Request(f"http://127.0.0.1:{port}/api/{what}", data=b"{}", method="POST",
                                      headers={"X-Token": token, "Content-Type": "application/json"})
-        urllib.request.urlopen(req, timeout=timeout).read()
+        _local(req, timeout).read()
         return True
     except Exception:   # noqa: BLE001 - older version without this call, or not FBT Pods at all
         return False
@@ -284,8 +418,106 @@ def _ask_running_instance_to_show(token, port=PORT):
     return _ask_running_instance(token, "show", port=port)
 
 
+def _mutex_name():
+    """The lock's name: one per data folder (the folder holds the token and the port file a second
+    launch needs), in this Windows session."""
+    where = os.path.normcase(os.path.abspath(C.DATA))
+    return MUTEX + hashlib.sha256(where.encode("utf-8")).hexdigest()[:16]
+
+
+def _claim_instance():
+    """True when this is the only FBT Pods of this data folder in this Windows session (it now
+    holds the named lock), False when another one holds it, None when that cannot be told."""
+    global _instance
+    if _instance is not None:
+        return True
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = wintypes.HANDLE
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.CreateMutexW(None, False, _mutex_name())
+        err = ctypes.get_last_error()
+    except Exception as e:   # noqa: BLE001
+        log.debug("instance lock: %s", e)
+        return None
+    if not h:
+        return None
+    if err == 183:                           # ERROR_ALREADY_EXISTS
+        # only looked: keeping this handle would keep the lock alive after the other one quits
+        k32.CloseHandle(h)
+        return False
+    _instance = h
+    return True
+
+
+def _port_file():
+    return os.path.join(C.DATA, "ui_port")
+
+
+def _known_port():
+    """The port the running FBT Pods of this data folder wrote down, or None."""
+    try:
+        with open(_port_file(), encoding="utf-8") as f:
+            port = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def _tell(text):
+    """A message for someone who started FBT Pods, when there is no window of ours to show it in."""
+    from .i18n import tr
+    text = tr(text)
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(None, text, "FBT Pods", 0x40 | 0x10000)  # information, foreground
+            return
+        except Exception:   # noqa: BLE001
+            pass
+    if sys.stdout is not None:
+        print(text, flush=True)
+
+
+def _hand_over(autostart, port=None, token=None):
+    """Pass this launch on to the FBT Pods that is already running: bring up its window, or (started
+    by SteamVR) let it start tracking. False when no FBT Pods answered (yet)."""
+    who = None
+    if port is None:
+        port = _known_port()                 # this data folder's running instance
+        if port is not None:
+            who = _who(port, token or _read_token())
+        if who != "ours":
+            port, who = find_instance(), None   # e.g. a copy started from another folder
+            if port is None:
+                return False
+    token = token or _read_token()           # read now: an instance writes it before it answers
+    who = who or _who(port, token)
+    if who is None:
+        return False
+    if who != "ours":
+        # another copy (its own data folder and token) or an older version: it is never sent our
+        # token, and a window opened with it there only showed "forbidden" for every button
+        log.warning("another FBT Pods (%s) is running on port %d: not starting a second one",
+                    "another copy" if who == "other" else "an older version", port)
+        if not autostart:
+            _tell(ANOTHER_COPY)
+        return True
+    if autostart:                            # SteamVR (re)started: let the open instance track
+        _ask_running_instance(token, "autostart", timeout=30, port=port)
+    elif not _ask_running_instance_to_show(token, port):
+        open_window(f"http://127.0.0.1:{port}/?t={token}")
+    return True
+
+
 def _exit(ctl, srv, tray):
     """Clean up and leave for real (no lingering background process)."""
+    srv.quit.set()                           # (also when the window was closed: /api/ping says so)
     if tray is not None:
         tray.stop()
     t = threading.Thread(target=lambda: (ctl.shutdown(), srv.httpd.shutdown()), daemon=True)
@@ -296,21 +528,40 @@ def _exit(ctl, srv, tray):
 
 
 def main(autostart=False, open_ui=True):
+    # One FBT Pods at a time, decided by a named lock rather than by who answers on the port: two
+    # launches close together (a second double click while the first is still loading, SteamVR's
+    # autostart and the user) both found nobody there yet and both started, with two tray icons, two
+    # windows and both opening the Bluetooth adapter. It also spares every start a 3 s port scan.
+    alone = _claim_instance()
+    end = time.monotonic() + HANDOVER_WAIT
+    while alone is False:                    # already running (or still starting): hand over to it
+        if _hand_over(autostart):
+            return
+        if time.monotonic() > end:
+            log.warning("another FBT Pods holds the instance lock but does not answer: not starting a second one")
+            if not autostart:
+                # (a double click must not end in nothing at all: say why no window comes)
+                _tell(ANOTHER_COPY)
+            return
+        time.sleep(0.5)
+        alone = _claim_instance()            # it has quit meanwhile (or ended while starting)
     token = _token()
-    running = find_instance()
-    if running is None and port_in_use() and not autostart and _ask_running_instance_to_show(token):
-        return                               # an older FBT Pods (no /api/ping) that knows our token
-    if running is not None:                  # already running: bring its window back
-        if autostart:                        # SteamVR (re)started: let the open instance track
-            _ask_running_instance(token, "autostart", timeout=30, port=running)
-        elif not _ask_running_instance_to_show(token, running):
-            open_window(f"http://127.0.0.1:{running}/?t={token}")
+    # an FBT Pods that the lock does not show: an older version or a copy with another data folder
+    # on our port (one Bluetooth adapter: not two of us), or, without a lock here, any instance
+    running = (find_instance() if alone is None
+               else PORT if port_in_use(PORT) and _is_fbtpods(PORT) else None)
+    if running is not None and _hand_over(autostart, running, token):
         return
     from . import window
     from .controller import Controller
     from .tray import Tray
     ctl = Controller()
     srv = Server(ctl, token)
+    try:                                     # where a second launch finds us (see _hand_over)
+        with open(_port_file(), "w", encoding="utf-8") as f:
+            f.write(str(srv.port))
+    except OSError as e:
+        log.debug("ui_port: %s", e)
     if autostart:
         ctl.refresh()
         if ctl.ready_to_run():
@@ -333,6 +584,7 @@ def main(autostart=False, open_ui=True):
             _exit(ctl, srv, tray)
         srv.native = False                   # WebView2 missing: browser app window below
     if open_ui and not autostart:
+        srv.show_request.clear()             # (a show asked for meanwhile is this window)
         open_window(srv.url())
     try:
         while not srv.quit.is_set():

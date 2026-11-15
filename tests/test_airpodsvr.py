@@ -58,8 +58,10 @@ def _setup(seed=1):
     drift = {"left": math.radians(37), "right": math.radians(-80)}
 
     def set_pose(shins):
+        import time
         for l, t in trackers.items():
             t.fusion.R_ws = rot_y(drift[l]) @ shins[l] @ mounts[l].T
+            t.last_update = time.monotonic()            # the buds are sending (resets need that)
     body = Body()
     rm = ResetManager(trackers, body, DriftEstimator({}, body))
     return trackers, mounts, drift, set_pose, rm, rr
@@ -245,7 +247,8 @@ def test_demo_mode_sends_three_trackers_and_resets(monkeypatch):
             fr.hands = {"left_hand": (np.eye(3), np.array([-0.3, 1.0, 0])),
                         "right_hand": (np.eye(3), np.array([0.3, 1.0, 0]))}
             fr.raw_from_standing = (np.eye(3), np.zeros(3))
-            fr.events, self.events = self.events, []
+            if t > 0.5:                 # once the try-out buds are sending (a reset needs data)
+                fr.events, self.events = self.events, []
             return fr
 
         def haptic(self, hand, ok):

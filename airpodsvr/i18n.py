@@ -15,8 +15,8 @@ import re
 
 from . import config as C
 
-LANGS = ["en", "zh", "ja", "ko"]            # the value of the "language" setting is the index
-NAMES = ["English", "繁體中文", "日本語", "한국어"]
+LANGS = ["en", "zh", "ja", "ko", "es"]      # the value of the "language" setting is the index:
+NAMES = ["English", "繁體中文", "日本語", "한국어", "Español"]   # new ones only ever at the end
 DEFAULT = "en"
 _DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "i18n")
 _CJK = re.compile(r"[㐀-鿿]")
@@ -27,9 +27,11 @@ def code(cfg=None):
     """Language code chosen in the settings."""
     cfg = C.load_config() if cfg is None else cfg
     try:
-        return LANGS[int(cfg.get("language", 0))]
-    except (TypeError, ValueError, IndexError):
+        i = int(cfg.get("language", 0))
+    except (TypeError, ValueError):
         return DEFAULT
+    # (a negative number is no language either: -1 would pick the last one)
+    return LANGS[i] if 0 <= i < len(LANGS) else DEFAULT
 
 
 def table(lang):
@@ -38,10 +40,16 @@ def table(lang):
         d = {}
         if lang != "zh":
             try:
-                with open(os.path.join(_DIR, lang + ".json"), encoding="utf-8") as f:
+                # utf-8-sig: a translation saved by Notepad starts with a byte order mark, which
+                # plain utf-8 refused (the whole language then fell back to the source text)
+                with open(os.path.join(_DIR, lang + ".json"), encoding="utf-8-sig") as f:
                     d = json.load(f)
             except (OSError, ValueError):
                 d = {}
+        # a language that is still being translated may have gaps: a missing or empty translation
+        # (or anything that is not text) leaves the source text, as for a missing file
+        d = {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str) and v.strip()} \
+            if isinstance(d, dict) else {}
         tpl = []
         for k, v in d.items():
             if "{}" in k:

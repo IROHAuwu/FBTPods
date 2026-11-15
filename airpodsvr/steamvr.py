@@ -23,6 +23,8 @@ ACTIONS = ("quick_reset", "full_reset", "touch_reset")
 # Bindings only work when SteamVR has loaded a binding file of ours for the controller type in use
 # and hands this program its input; with some setups (reported: Quest Pro over Virtual Desktop)
 # nothing arrived at all. The direct reading needs neither. "menu" is Y / B, "a" is X / A.
+# It stops for a controller once its bindings have delivered a press (they work: what the user
+# rebinds in SteamVR then counts), for as long as they stay active.
 DIRECT = {("left_hand", "menu", "double"): "quick_reset", ("left_hand", "menu", "long"): "full_reset",
           ("left_hand", "a", "long"): "touch_reset",
           ("right_hand", "menu", "long"): "touch_reset"}
@@ -34,7 +36,7 @@ class ButtonGestures:
     LONG_S = 0.6             # held this long
 
     def __init__(self):
-        self.down = {}       # key -> time it went down (None once its long press was reported)
+        self.down = {}       # key -> time it went down (None once used up: long press, second of a double, forgotten)
         self.last = {}       # key -> time of the previous press
 
     def feed(self, now, pressed: dict):
@@ -46,6 +48,10 @@ class ButtonGestures:
                 if now - self.last.get(key, -1e9) <= self.DOUBLE_S:
                     out.append((key, "double"))
                     self.last.pop(key, None)             # a third press starts over
+                    # this press is used up: kept down a little long (crouched, seated), it also
+                    # became a long press, and the quick reset was followed by a full reset that
+                    # took the crouched eye height as the body height
+                    self.down[key] = None
                 else:
                     self.last[key] = now
             elif on and self.down[key] is not None and now - self.down[key] >= self.LONG_S:
@@ -55,6 +61,14 @@ class ButtonGestures:
             elif not on:
                 self.down.pop(key, None)
         return out
+
+    def forget(self, key):
+        """Not watched for a while: no gesture spans the gap (a press seen before it is neither
+        the first half of a double press nor the start of a long one). A button still held when
+        watching starts again counts only after it is let go: that press began while it was not
+        ours (a game's Y held through the gap became a full reset 0.6 s after the gap)."""
+        self.down[key] = None
+        self.last.pop(key, None)
 
 
 @dataclass
@@ -69,42 +83,59 @@ class Frame:
 
 
 class SteamVRBridge:
-    def __init__(self, steamvr_dir):
+    # legacy vibration (no binding for it): one buzz = success, two = failure, as (start, length) in s
+    BUZZ_S = {True: ((0.0, 0.12),), False: ((0.0, 0.08), (0.18, 0.08))}
+    PULSE_GAP_S = 0.01       # OpenVR drops a pulse sent within 5 ms of the previous one on a controller
+
+    def __init__(self, steamvr_dir, direct_buttons=True):
         import openvr
         self.ov = openvr
         self.steamvr_dir = os.path.abspath(steamvr_dir)
+        self.direct = bool(direct_buttons)   # also read the buttons directly (see DIRECT); False: bindings only
         # A "background" application only finds out whether SteamVR runs (it never starts it), but
         # SteamVR gives controller input to scene and overlay applications: as a background one,
         # none of the controller buttons did anything (seen with a Quest Pro over Virtual Desktop).
         # So: ask as a background application first, and when SteamVR is there, come back as an
         # overlay application (the kind SteamVR's binding screen lists and feeds).
         self.vr = openvr.init(openvr.VRApplication_Background)
-        self.app_type = "background"
         try:
-            openvr.shutdown()
-            self.vr = openvr.init(openvr.VRApplication_Overlay)
-            self.app_type = "overlay"
-        except Exception as e:   # noqa: BLE001 - keep working as before rather than not at all
-            log.warning("SteamVR: no overlay session (%s), controller buttons may not work", e)
-            self.vr = openvr.init(openvr.VRApplication_Background)
-        self.vr_input = openvr.VRInput()
-        try:
-            openvr.VRApplications().addApplicationManifest(write_app_manifest(self.steamvr_dir), False)
-        except Exception as e:   # noqa: BLE001 - already registered, or not allowed: bindings still work
-            log.debug("app manifest: %s", e)
-        try:        # this process is that application: its bindings are the ones saved under its key
-            openvr.VRApplications().identifyApplication(os.getpid(), "airpodsvr.trackers")
-        except Exception as e:   # noqa: BLE001
-            log.debug("identify application: %s", e)
-        self.vr_input.setActionManifestPath(os.path.join(self.steamvr_dir, "actions.json"))
-        self.set_handle = self.vr_input.getActionSetHandle("/actions/airpodsvr")
-        self.action = {a: self.vr_input.getActionHandle(f"/actions/airpodsvr/in/{a}") for a in ACTIONS}
-        self.haptic_handle = self.vr_input.getActionHandle("/actions/airpodsvr/out/haptic")
-        self.source = {"left_hand": self.vr_input.getInputSourceHandle("/user/hand/left"),
-                       "right_hand": self.vr_input.getInputSourceHandle("/user/hand/right")}
+            self.app_type = "background"
+            try:
+                openvr.shutdown()
+                self.vr = openvr.init(openvr.VRApplication_Overlay)
+                self.app_type = "overlay"
+            except Exception as e:   # noqa: BLE001 - keep working as before rather than not at all
+                log.warning("SteamVR: no overlay session (%s), controller buttons may not work", e)
+                self.vr = openvr.init(openvr.VRApplication_Background)
+            self.vr_input = openvr.VRInput()
+            try:
+                openvr.VRApplications().addApplicationManifest(write_app_manifest(self.steamvr_dir), False)
+            except Exception as e:   # noqa: BLE001 - already registered, or not allowed: bindings still work
+                log.debug("app manifest: %s", e)
+            try:        # this process is that application: its bindings are the ones saved under its key
+                openvr.VRApplications().identifyApplication(os.getpid(), "airpodsvr.trackers")
+            except Exception as e:   # noqa: BLE001
+                log.debug("identify application: %s", e)
+            self.vr_input.setActionManifestPath(os.path.join(self.steamvr_dir, "actions.json"))
+            self.set_handle = self.vr_input.getActionSetHandle("/actions/airpodsvr")
+            self.action = {a: self.vr_input.getActionHandle(f"/actions/airpodsvr/in/{a}") for a in ACTIONS}
+            self.haptic_handle = self.vr_input.getActionHandle("/actions/airpodsvr/out/haptic")
+            self.source = {"left_hand": self.vr_input.getInputSourceHandle("/user/hand/left"),
+                           "right_hand": self.vr_input.getInputSourceHandle("/user/hand/right")}
+        except BaseException:
+            # Something failed after the init (the action manifest refused, SteamVR restarting under
+            # us): let go of the session here. The caller gets no bridge it could shut down; it
+            # tries again a few seconds later with a new init, and if tracking is stopped instead,
+            # a session left open keeps SteamVR waiting for this program (then killing it) as it quits.
+            try:
+                openvr.shutdown()
+            except Exception as e:   # noqa: BLE001
+                log.debug("shutdown after a failed start: %s", e)
+            raise
         self.prev = {}
         self.gestures = ButtonGestures()
         self.fired = {}                      # (action, hand) -> when it last fired, from either source
+        self.proven = set()                  # hands whose bindings delivered a press: not read directly while active
         self.said = {}                       # what was logged about the controllers, to say it once
         self.vmt_index = {}                  # "VMT_0" -> device index
         self.vmt_scan_t = -1e9
@@ -148,6 +179,7 @@ class SteamVRBridge:
                     log.warning("headset has no raw-universe pose: placing trackers by measurement")
         import time as _time
         now = _time.monotonic()
+        self._pulse(now)
         if now - self.vmt_scan_t > 2.0:      # VMT trackers appear after their first pose
             self.vmt_scan_t = now
             self.vmt_index = self._find_vmt()
@@ -166,6 +198,9 @@ class SteamVRBridge:
                     fr.hands[hand] = openvr_matrix_to_np(std[i].mDeviceToAbsoluteTracking)
 
         bound = {}
+        proven = getattr(self, "proven", None)
+        if proven is None:
+            proven = self.proven = set()
         try:
             self.vr_input.updateActionState(self._action_sets())
             for a, h in self.action.items():
@@ -176,12 +211,24 @@ class SteamVRBridge:
                     state = bool(d.bActive and d.bState)
                     if state and not self.prev.get(key, False):
                         self._fire(fr, a, hand, now, "binding")
+                        if hand not in proven:
+                            proven.add(hand)
+                            log.info("controller %s: its bindings work, its buttons are read directly "
+                                     "only while they are not active", hand)
                     self.prev[key] = state
         except Exception as e:   # noqa: BLE001 - no bindings: the direct reading below still works
             self._say_once("actions", f"SteamVR bindings unavailable ({e}): reading the buttons directly")
-        # the same buttons, read directly
+        # the same buttons, read directly. Not for a controller whose bindings have delivered a press
+        # and are active now: the fixed DIRECT gestures would undo whatever the user rebound in
+        # SteamVR's binding screen (a game's own Y held for 0.6 s still ran a full reset). Read
+        # again while its bindings are not active: an overlay application may get binding input
+        # only at times (no game running, dashboard open), and then the buttons would do nothing.
         pressed = {}
         for hand, i in index.items():
+            if not getattr(self, "direct", True) or (hand in proven and bound.get(hand)):
+                for button in ("menu", "a"):     # when the reading comes back, it starts afresh (see forget)
+                    self.gestures.forget((hand, button))
+                continue
             mask = self._buttons(i)
             if mask is None:
                 continue
@@ -194,6 +241,10 @@ class SteamVRBridge:
             a = DIRECT.get((hand, button, gesture))
             if a:
                 self._fire(fr, a, hand, now, "direct")
+        types = getattr(self, "_types", None)
+        if types:                            # a controller gone: ask its successor's type anew
+            for i in [i for i in types if i not in index.values()]:
+                del types[i]
         self._say_once("controllers", "controllers: " + (", ".join(
             f"{hand} {self._controller_type(i)} (bindings {'active' if bound.get(hand) else 'not active'})"
             for hand, i in sorted(index.items())) or "none found"))
@@ -238,10 +289,20 @@ class SteamVRBridge:
         return int(state.ulButtonPressed) if ok else None
 
     def _controller_type(self, i):
-        try:
-            return self.vr.getStringTrackedDeviceProperty(i, self.ov.Prop_ControllerType_String) or "?"
-        except Exception:   # noqa: BLE001
-            return "?"
+        """Asked once per controller: the line it goes into is built every frame, and each question
+        is a call into SteamVR (two controllers at 90 Hz: 180 calls a second for one log line)."""
+        types = getattr(self, "_types", None)
+        if types is None:
+            types = self._types = {}
+        t = types.get(i)
+        if t is None:
+            try:
+                t = self.vr.getStringTrackedDeviceProperty(i, self.ov.Prop_ControllerType_String) or "?"
+            except Exception:   # noqa: BLE001
+                t = "?"
+            if t != "?":                     # not known yet (still starting): asked again next frame
+                types[i] = t
+        return t
 
     def _say_once(self, key, text):
         if self.said.get(key) != text:
@@ -266,15 +327,20 @@ class SteamVRBridge:
     def held(self, action, hand):
         return self.prev.get((action, hand), False)
 
-    def haptic(self, hand, ok=True):
+    def haptic(self, hand, ok=True, now=None):
         """One short pulse = success, two = failure."""
         src = self.source.get(hand, self.ov.k_ulInvalidInputValueHandle)
         if not getattr(self, "bound", {}).get(hand) and hand in getattr(self, "index", {}):
-            try:             # no binding for the vibration either: the older call, one buzz or two
-                for _ in range(1 if ok else 2):
-                    self.vr.triggerHapticPulse(self.index[hand], 0, 3500)
-            except Exception as e:   # noqa: BLE001
-                log.debug("haptic pulse: %s", e)
+            # no binding for the vibration either: the older call, one buzz or two. One call is a
+            # single ~3.5 ms tick, and OpenVR drops a second one sent within 5 ms: two calls in a
+            # row felt like one, so a refused reset felt like a done one. Each buzz is a pulse every
+            # PULSE_GAP_S for its length instead, sent from here and from poll().
+            if now is None:
+                import time as _time
+                now = _time.monotonic()
+            buzz = [b for b in getattr(self, "_buzz", []) if b[0] != hand]      # the newest one counts
+            self._buzz = buzz + [[hand, now + t0, now + t0 + n, False] for t0, n in self.BUZZ_S[bool(ok)]]
+            self._pulse(now)
         try:
             if ok:
                 self.vr_input.triggerHapticVibrationAction(self.haptic_handle, 0.0, 0.12, 160.0, 0.8, src)
@@ -283,6 +349,30 @@ class SteamVRBridge:
                 self.vr_input.triggerHapticVibrationAction(self.haptic_handle, 0.18, 0.08, 160.0, 1.0, src)
         except Exception as e:   # noqa: BLE001
             log.debug("haptic: %s", e)
+
+    def _pulse(self, now):
+        """The legacy buzzes haptic() started: one pulse per controller every PULSE_GAP_S while a
+        buzz lasts, and at least one per buzz even when the loop was slow and its time has passed."""
+        buzz = getattr(self, "_buzz", None)
+        if not buzz:
+            return
+        last = getattr(self, "_pulse_t", None)
+        if last is None:
+            last = self._pulse_t = {}
+        for b in buzz:
+            hand, t0, t1, done = b
+            i = getattr(self, "index", {}).get(hand)
+            if now < t0 or now - last.get(hand, -1e9) < self.PULSE_GAP_S or i is None:
+                continue
+            if now >= t1 and done:
+                continue
+            last[hand], b[3] = now, True
+            try:
+                self.vr.triggerHapticPulse(i, 0, 3500)
+            except Exception as e:   # noqa: BLE001
+                log.debug("haptic pulse: %s", e)
+        # over: its time has passed and it was felt (or its controller is gone)
+        self._buzz = [b for b in buzz if not (now >= b[2] and (b[3] or b[0] not in getattr(self, "index", {})))]
 
     # ---------------------------------------------------------------- one-time conveniences
     def assign_vmt_roles(self, indices: dict):

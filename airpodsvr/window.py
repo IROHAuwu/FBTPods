@@ -21,6 +21,47 @@ log = logging.getLogger(__name__)
 
 ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "icon.ico")
 APP_ID = "FBTPods.Trackers"
+# the WebView2 runtime and its preview channels, as pywebview looks them up
+WEBVIEW2 = ("{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}", "{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}",
+            "{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}", "{65C35B14-6C1D-4122-AC46-7148CC9D6497}")
+SM_SHUTTINGDOWN = 0x2000
+
+
+def _version(text):
+    out = []
+    for part in str(text).split("."):
+        try:
+            out.append(int(part))
+        except ValueError:
+            out.append(0)
+    return tuple(out)
+
+
+def _webview2():
+    """Version of the WebView2 runtime pywebview would use, or None.
+
+    Without it pywebview does not fail: it quietly shows the page in the Internet Explorer engine,
+    which cannot run the window's scripts (a window where nothing works), and the browser window
+    we fall back to is never opened. So it is checked here, the way pywebview checks it."""
+    import platform
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full") as k:
+            if winreg.QueryValueEx(k, "Release")[0] < 394802:      # .NET Framework 4.6.2
+                return None
+    except OSError:
+        return None
+    for key in WEBVIEW2:
+        for hive in ("HKEY_CURRENT_USER", "HKEY_LOCAL_MACHINE"):
+            where = "Microsoft" if platform.machine() == "x86" or hive == "HKEY_CURRENT_USER" else r"WOW6432Node\Microsoft"
+            try:
+                with winreg.OpenKey(getattr(winreg, hive), rf"SOFTWARE\{where}\EdgeUpdate\Clients\{key}") as k:
+                    pv = str(winreg.QueryValueEx(k, "pv")[0])
+            except OSError:
+                continue
+            if _version(pv) >= (86, 0, 622, 0):
+                return pv
+    return None
 
 
 def available():
@@ -28,9 +69,26 @@ def available():
         return False
     try:
         import webview  # noqa: F401
-        return True
     except Exception as e:   # noqa: BLE001
         log.info("native window unavailable (%s); using a browser app window", e)
+        return False
+    try:
+        wv2 = _webview2()
+    except Exception as e:   # noqa: BLE001
+        log.info("WebView2 runtime check failed (%s); using a browser app window", e)
+        return False
+    if wv2 is None:
+        log.warning("the Microsoft Edge WebView2 runtime is not installed: using a browser app window "
+                    "(install the WebView2 Evergreen runtime from Microsoft for FBT Pods' own window)")
+        return False
+    return True
+
+
+def _session_ending():
+    """Windows is shutting down or signing out."""
+    try:
+        return bool(ctypes.windll.user32.GetSystemMetrics(SM_SHUTTINGDOWN))
+    except Exception:   # noqa: BLE001
         return False
 
 
@@ -68,11 +126,28 @@ def run(url, srv, ctl, hidden=False, tray=None):
         "FBT Pods", url, width=1180, height=780, min_size=(880, 600), hidden=hidden,
         background_color="#0b0f14", text_select=True, confirm_close=False)
 
+    def on_form_closing(sender, args):
+        """Windows is ending the session (shut down, restart, sign out): let the window close even
+        while tracking. pywebview asks on_closing first, which cannot see why the window closes, and
+        its "no" made Windows say that FBT Pods is preventing the shutdown."""
+        try:
+            if "WindowsShutDown" not in str(args.CloseReason):
+                return
+            state["quitting"] = True
+            args.Cancel = False
+            log.info("Windows is ending the session: closing")
+        except Exception as e:   # noqa: BLE001
+            log.debug("closing reason: %s", e)
+
     def on_shown():
         try:
             _set_icon(int(win.native.Handle.ToInt64()))
         except Exception as e:   # noqa: BLE001
             log.debug("hwnd: %s", e)
+        try:
+            win.native.FormClosing += on_form_closing     # runs after pywebview's own handler
+        except Exception as e:   # noqa: BLE001
+            log.debug("FormClosing: %s", e)
 
     def busy():
         """"tracking" / "working" / None (see Controller.busy)."""
@@ -81,11 +156,20 @@ def run(url, srv, ctl, hidden=False, tray=None):
             return b()
         return "tracking" if ctl.running else ("working" if (ctl.flow and not ctl.flow.done) else None)
 
+    def hide():
+        if state["quitting"]:                # closing for real after all (Windows ending the session)
+            return
+        try:
+            win.hide()
+        except Exception as e:   # noqa: BLE001
+            log.debug("hide: %s", e)
+
     def on_closing():
         why = busy()
-        if why and not state["quitting"]:
+        # (when Windows shuts down or signs out, closing is never refused)
+        if why and not state["quitting"] and not _session_ending():
             state["visible"] = False
-            threading.Thread(target=win.hide, daemon=True).start()
+            threading.Thread(target=hide, daemon=True).start()
             if tray is not None:
                 if why == "tracking":
                     tray.notify_hidden()
@@ -101,11 +185,16 @@ def run(url, srv, ctl, hidden=False, tray=None):
 
     win.events.shown += on_shown
     win.events.closing += on_closing
+    # set when the GUI loop has ended or never started: from then on main() in webui handles the
+    # tray's "open" and the quit, and the watcher must not take those requests (and lose them)
+    gone = threading.Event()
 
     def watcher():
         idle_since = None
         while True:
             time.sleep(0.25)
+            if gone.is_set():
+                return
             if tray is not None:
                 tray.update()
             if srv.quit.is_set():
@@ -115,7 +204,14 @@ def run(url, srv, ctl, hidden=False, tray=None):
             if srv.show_request.is_set():
                 srv.show_request.clear()
                 state["visible"] = state["ever_shown"] = True
-                win.show()
+                try:
+                    win.show()
+                except Exception as e:   # noqa: BLE001 - e.g. the window failed to start meanwhile
+                    log.debug("show: %s", e)
+                    if gone.is_set():
+                        srv.show_request.set()       # still wanted: webui.main opens a browser window
+                        return
+                    continue
                 try:
                     win.restore()
                 except Exception:   # noqa: BLE001
@@ -136,6 +232,8 @@ def run(url, srv, ctl, hidden=False, tray=None):
         webview.start(gui="edgechromium", private_mode=False,
                       storage_path=C.data_path("webview"))
     except Exception as e:   # noqa: BLE001 - e.g. WebView2 runtime missing
+        gone.set()
         log.warning("native window failed: %s", e)
         return False
+    gone.set()
     return True

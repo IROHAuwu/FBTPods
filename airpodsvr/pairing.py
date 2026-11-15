@@ -134,6 +134,10 @@ class LegIdentifier:
         return {l.addr: l.buds.evidence() for l in self.links if hasattr(l, "buds")}
 
     def close(self):
+        for l in self.links:                 # every goodbye starts at once (each stop() waits for its own)
+            flag = getattr(l, "stop_flag", None)
+            if flag is not None:
+                flag.set()
         for l in self.links:
             l.stop()
         for l in self.links:

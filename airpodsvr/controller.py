@@ -88,10 +88,12 @@ class Flow:
         self.done = False
         self.cancelled = False
         self.progress = False
+        self.shown = 0                # counts the showings: an answer names the one it answers
 
     def show(self, text, buttons=(), step="", progress=False, panel=None, picture=None):
         self.ev.clear()
         self.answer = None
+        self.shown += 1
         self.panel = panel
         self.picture = picture
         self.text, self.buttons, self.items, self.step, self.progress = text, list(buttons), None, step, progress
@@ -101,12 +103,21 @@ class Flow:
         return self.answer
 
     def choose(self, prompt, items):
+        """Indices of the ticked items, or None (cancelled, or nothing ticked)."""
         self.show(prompt, ["確定", "取消"])
         self.items = list(items)
         a = self.wait()
         if a == "取消" or self.cancelled:
             return None
-        return list(self.choice or [0])
+        if self.choice is None:              # no list came with the answer at all: the first item
+            return [0]
+        # Nothing ticked means "none of these", never "the first one": that paired whatever device
+        # was listed first (maybe someone else's AirPods) and replaced the user's own pairing.
+        picked = []
+        for i in self.choice if isinstance(self.choice, (list, tuple)) else ():
+            if isinstance(i, int) and not isinstance(i, bool) and 0 <= i < len(self.items) and i not in picked:
+                picked.append(i)
+        return picked or None
 
     def reply(self, value, choice=None):
         if value == "取消":
@@ -118,7 +129,7 @@ class Flow:
     def to_dict(self):
         return {"id": self.id, "kind": self.kind, "title": self.title, "text": self.text,
                 "buttons": self.buttons, "items": self.items, "step": self.step, "progress": self.progress,
-                "panel": self.panel, "picture": self.picture, "done": self.done}
+                "panel": self.panel, "picture": self.picture, "done": self.done, "shown": self.shown}
 
 
 class LogBuffer(logging.Handler):
@@ -150,6 +161,10 @@ class Controller:
     slime_up = None                    # a SlimeVR Server is holding its tracker port (None: not checked)
     vmt_new = None                     # tag of a VMT release newer than the one we install
     ui_seen = 0.0                      # last time the window asked for the state
+    _stopping = None                   # a session stop() gave up waiting for: it still holds the dongle
+    STOP_WAIT = 15.0                   # seconds stop() waits for a session to let go of the dongle
+    # setup steps that open the Bluetooth adapter or change its driver: no tracking meanwhile
+    DONGLE_FLOWS = ("dongle", "restore", "pair")
 
     def __init__(self):
         self.app = None
@@ -160,7 +175,7 @@ class Controller:
         self.dongle = ("unknown", None)
         self.vmt_ok = None
         self.steamvr_installed = None
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()      # start / stop of tracking, one at a time (see _life)
         self._slow_stop = threading.Event()
         from .monitor import SensorMonitor
         self.monitor = SensorMonitor(self)
@@ -264,7 +279,28 @@ class Controller:
     # ---------------------------------------------------------------- running
     @property
     def running(self):
-        return self.app is not None and self.app.thread is not None and self.app.thread.is_alive()
+        """A session is running, or is still stopping (until it has ended it holds the dongle)."""
+        return self._alive(self.app) or self._alive(self._stopping)
+
+    @staticmethod
+    def _alive(app):
+        th = getattr(app, "thread", None)
+        return th is not None and th.is_alive()
+
+    def _life(self):
+        """The lock that makes starting and stopping tracking one step each. Made here when missing
+        (a Controller built without __init__, as the tests do)."""
+        lock = self.__dict__.get("lock")
+        if lock is None:
+            lock = self.__dict__.setdefault("lock", threading.RLock())
+        return lock
+
+    def setup_holds_dongle(self):
+        """A setup step that opens the Bluetooth adapter or changes its driver (preparing it, giving
+        it back, pairing) is open: tracking would open the adapter a second time and fail, or
+        disturb the step."""
+        fl = getattr(self, "flow", None)
+        return fl is not None and not fl.done and fl.kind in self.DONGLE_FLOWS
 
     def ready_to_run(self):
         roles = config_roles(self.cfg)
@@ -273,20 +309,59 @@ class Controller:
         return self.dongle[0] == "ready" and bool(roles.get("left_shin")) and bool(roles.get("right_shin"))
 
     def start(self, demo=False):
-        if self.running:
-            return
-        if self.monitor.mode in ("live", "sim"):   # one connection to the dongle at a time
-            self.monitor.stop()
-        from .app import App
-        self.app = App(demo=demo)
-        self.app.start()
+        # One start or stop at a time. Building a session takes a while (calibration, the pose
+        # model), and two requests in that time (a double click, the tray and the window, SteamVR's
+        # autostart) made two sessions: one out of reach of stop(), holding the dongle and the VMT
+        # trackers. A start that comes while stop() waits for the old session runs after it.
+        with self._life():
+            if self.running:
+                return
+            if self.setup_holds_dongle():
+                log.info("start tracking: not now, the %s step is using the Bluetooth adapter", self.flow.kind)
+                return
+            self._stopping = None            # (one that hung in its shutdown has ended by now: let it go)
+            from .app import App
+            app = App(demo=demo)
+            # the sensor page was showing a session that ended by itself: show this one instead
+            retap = self.monitor.mode == "tap"
+            if self.monitor.mode in ("live", "sim", "tap"):   # one connection to the dongle at a time
+                self.monitor.stop()
+            self.app = app
+            app.start()
+            if retap and self._alive(app):
+                self.monitor.start()
 
     def stop(self):
-        if self.monitor.mode == "tap":
-            self.monitor.stop()
-        app, self.app = self.app, None
-        if app:
-            app.stop()
+        """Stop tracking. Returns once the session has let go of the dongle, so whatever opens it next
+        (a new session, pairing, the sensor page, the diagnosis) finds it free; until then `running`
+        stays true. A session that hangs gets STOP_WAIT seconds, and counts as running until it ends."""
+        with self._life():
+            app = self.app if self.app is not None else self._stopping
+            if app is not None:
+                t0 = time.monotonic()
+                app.stop()                   # tells it to end; waits a few seconds itself
+                th = getattr(app, "thread", None)
+                if th is not None and th is not threading.current_thread():
+                    th.join(max(0.0, self.STOP_WAIT - (time.monotonic() - t0)))
+                # kept as "stopping" before it stops being the session: in between, `running` read
+                # False for a session that still holds the dongle
+                self._stopping = app if self._alive(app) else None
+                if self.app is app:
+                    self.app = None
+                if self._stopping is not None:
+                    log.warning("tracking has not ended %.0f s after stop: the Bluetooth adapter is still in use",
+                                time.monotonic() - t0)
+            # (the sensor page stays on the session while it ends: its own start would find the dongle busy)
+            if self.monitor.mode == "tap":
+                self.monitor.stop()
+
+    def _dongle_free(self, fl):
+        """After stop(): False, and says so, while the last session still holds the adapter."""
+        if not self._alive(self._stopping):
+            return True
+        fl.show("上一次的追蹤還在結束中，藍芽還沒有釋放。請過幾秒後再試一次。", ["關閉"])
+        fl.wait()
+        return False
 
     def action(self, name, hand="left_hand", delay=0.0):
         """A reset from the window. With `delay` it runs after a countdown with beeps: the person
@@ -363,14 +438,20 @@ class Controller:
         if clean:
             C.save_config(clean)
         self.cfg = C.load_config()
-        if self.app:
-            self.app.apply_settings(self.cfg)
+        # only into a session that runs (the lock: not one that stop() is ending). One that has ended
+        # has closed its pose model, and the "use pose model" setting would load it again into a
+        # worker nobody closes (~100 MB). The next session reads the settings anyway.
+        with self._life():
+            app = self.app
+            if self._alive(app):
+                app.apply_settings(self.cfg)
         return self.settings()
 
     # ---------------------------------------------------------------- state for the UI
     def state(self, since_log=0):
         self.ui_seen = time.monotonic()
-        st = self.app.status() if self.app else None
+        app = self.app                     # read once: stop() lets go of it from another thread
+        st = app.status() if app else None
         running = self.running
         roles = config_roles(self.cfg)
         dstate, dev = self.dongle
@@ -390,7 +471,8 @@ class Controller:
             rows.append(("airpods", "idle", f"試用模式中（模擬 {n} 顆：{layout_text(st['trackers'])}）", None))
         elif st and st["links"]:
             zh = {"streaming": "串流中", "connecting": "連線中", "waiting for sensors": "等待感測器", "stopped": "已停止",
-                  "idle": "準備中", "needs pairing": "耳機已不認得這台電腦", "stalled": "資料中斷，重試中"}
+                  "idle": "準備中", "needs pairing": "耳機已不認得這台電腦", "stalled": "資料中斷，重試中",
+                  "adapter lost": "USB藍芽已中斷：插回後請停止再開始追蹤"}
             kinds = {"raw": "原始 IMU 約 100 Hz", "wx-raw": "原始 IMU（Pro／4，實驗性）",
                      "fused": "融合姿態約 25 Hz（實驗性）"}
 
@@ -554,9 +636,15 @@ class Controller:
         except Exception:   # noqa: BLE001
             log.exception("start after pairing")
 
-    def answer_flow(self, flow_id, value, choice=None):
-        if self.flow and self.flow.id == flow_id:
-            self.flow.reply(value, choice)
+    def answer_flow(self, flow_id, value, choice=None, shown=None):
+        """`shown`: which showing of the step the window answered. A late click (or a Cancel from a
+        dialog shown again unchanged) used to land on whatever step came next."""
+        fl = self.flow
+        if fl and fl.id == flow_id:
+            if shown is not None and shown != getattr(fl, "shown", shown):
+                log.info("flow answer %r for an earlier step ignored", value)
+                return
+            fl.reply(value, choice)
 
     def _run_flow(self, kind, title, fn):
         if self.flow and not self.flow.done:
@@ -590,6 +678,8 @@ class Controller:
     def _flow_dongle(self, fl):
         self.monitor.stop()
         self.stop()
+        if not self._dongle_free(fl):
+            return
         state, dev = self.dongle
         target = dev if state == "needs_driver" else None
         if target is None:
@@ -722,6 +812,10 @@ class Controller:
                 declared = int(r.headers.get("Content-Length") or 0)
                 total = declared or 103_423_171
                 got = 0
+                # one showing for the whole download, only its text changes: every show() counts as
+                # a new step, and answer_flow drops an answer for an earlier one, so a Cancel clicked
+                # between two 1 MB chunks was ignored and the download ran to the end
+                fl.show(f"下載中… {got / 1e6:.0f} / {total / 1e6:.0f} MB", ["取消"], progress=True)
                 while True:
                     if fl.cancelled:
                         raise RuntimeError("已取消")
@@ -730,7 +824,7 @@ class Controller:
                         break
                     f.write(chunk)
                     got += len(chunk)
-                    fl.show(f"下載中… {got / 1e6:.0f} / {total / 1e6:.0f} MB", ["取消"], progress=True)
+                    fl.text = f"下載中… {got / 1e6:.0f} / {total / 1e6:.0f} MB"
             if declared and got != declared:
                 raise RuntimeError(f"下載不完整（{got / 1e6:.0f} / {declared / 1e6:.0f} MB），請再試一次")
             sd = load_checkpoint(tmp)                     # also checks it is the expected network
@@ -745,9 +839,18 @@ class Controller:
             fl.show(f"下載失敗：{e}", ["關閉"])
             fl.wait()
             return
-        if self.app is not None:
-            self.app.core.load_model(self.app.cfg)
-        fl.show("完成！姿勢模型已啟用（設定裡的「使用姿勢模型」可以關閉）。", ["完成"])
+        use = bool(C.load_config().get("use_pose_model", True))
+        # into the running session only, and only when the setting wants it: a session that has
+        # ended (SteamVR closed) already closed its model, and loading one there starts a worker
+        # with ~100 MB of weights that nobody closes. The next session loads it when it starts.
+        with self._life():
+            app = self.app
+            if use and self._alive(app):
+                app.core.load_model(app.cfg)
+        if use:
+            fl.show("完成！姿勢模型已啟用（設定裡的「使用姿勢模型」可以關閉）。", ["完成"])
+        else:
+            fl.show("完成！姿勢模型已下載。設定裡的「使用姿勢模型」目前是關閉的，打開後才會使用。", ["完成"])
         fl.wait()
 
     def _flow_restore(self, fl):
@@ -766,6 +869,8 @@ class Controller:
         if fl.wait() != "還原":
             return
         self.stop()
+        if not self._dongle_free(fl):
+            return
         self._restore(fl, dev)
 
     SLIMEVR_SETUP_URL = "https://docs.slimevr.dev/quick-setup"
@@ -843,6 +948,8 @@ class Controller:
         from .transport import open_backend
         self.stop()
         self.monitor.stop()          # the sensor test page holds the dongle otherwise
+        if not self._dongle_free(fl):
+            return
         cfg = C.load_config()
         start_now = False
         backend = open_backend(cfg)
@@ -1167,8 +1274,14 @@ class Controller:
                     "要用這個精靈：設定 →「身體演算與輸出」改成 FBT Pods 自己算，再重新開始追蹤。", ["關閉"])
             fl.wait()
             return
-        go = threading.Event()
-        app.wizard_hook = lambda hand: (setattr(fl, "answer", "下一步"), go.set(), fl.ev.set())
+        def hook(hand):
+            # the controller's long press is the screen's first button: 下一步 on a step, 重試 when a
+            # step did not work (a fixed 下一步 there ended the wizard half done). Nothing while
+            # the countdown runs: there is no button to press then.
+            buttons = list(fl.buttons)
+            if buttons and not fl.progress:
+                fl.reply(buttons[0])
+        app.wizard_hook = hook
         steps = self.wizard_steps(app.core.trackers)
         try:
             i = 0
@@ -1211,10 +1324,15 @@ class Controller:
                 fl.show(f"這一步沒有成功：\n{why}", ["重試", "略過", "取消"] if skippable else ["重試", "取消"],
                         step, picture=pic)
                 a = fl.wait()
+                if fl.cancelled:
+                    return
                 if a == "略過":
                     i += 1
-                elif a != "重試":
+                elif a not in ("重試", "下一步"):    # (a 下一步 meant for the step before: try again)
                     return
+            # from here the long press is a full reset again, as the screen says: it used to only
+            # close this screen
+            app.wizard_hook = None
             fl.show("校正完成！\n\n之後每次開始追蹤，只要站直按「完整重置」（左手 Y 長按）。", ["完成"])
             fl.wait()
         finally:

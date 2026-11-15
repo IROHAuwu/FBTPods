@@ -43,16 +43,19 @@ class Stats:
     def add(self, source, s):
         with self.lock:
             st = self.src.setdefault(source, {"n": 0, "ts": [], "arr": [], "fusion": BudFusion(),
-                                              "heading": [], "gyro": []})
+                                              "heading": [], "gyro": [], "fused": []})
             st["n"] += 1
             st["ts"].append(s.ts_ns)
             st["arr"].append(s.arrival)
+            st["fused"].append(s.quat is not None)     # the bud's own attitude, not raw accel + gyro
+            # with ts / arr / fused: window() masks these lists together, so they stay the same length
+            st["gyro"].append(float(np.linalg.norm(s.gyr)))
             if s.quat is not None:
                 R = st["fusion"].update_fused(s.ts_ns, s.quat, s.gyr)
             else:
                 R = st["fusion"].update(s.ts_ns, s.acc, s.gyr)
-            st["heading"].append((s.arrival, heading_of(R)))
-            st["gyro"].append(float(np.linalg.norm(s.gyr)))
+            if R is not None:            # an attitude that is not a number is refused: no heading from it
+                st["heading"].append((s.arrival, heading_of(R)))
 
     def window(self, t0, t1):
         out = {}
@@ -70,8 +73,11 @@ class Stats:
                 off = off - off.min()
                 g = np.array(st["gyro"])[m]
                 still = g < math.radians(3)
+                fused = np.array(st["fused"], dtype=bool)[m]
                 out[k] = {
                     "samples": int(m.sum()),
+                    # raw accel + gyro, or the fused attitude (~25 Hz): AirPods Pro 2 / Pro 3 / 4 send either
+                    "stream": "fused" if fused.all() else ("raw" if not fused.any() else "mixed"),
                     "rate_hz": round(float(1.0 / np.median(dts)), 1) if np.median(dts) > 0 else 0,
                     "gaps_over_50ms": int((dts > 0.05).sum()),
                     "longest_gap_ms": round(float(dts.max() * 1000), 1),
@@ -98,6 +104,15 @@ class Stats:
                           "total_deg": round(float(np.degrees(v[-1] - v[0])), 2),
                           "gyro_bias_rad_s": st["fusion"].bias()[0]}
         return out
+
+
+def link_info(links):
+    """Which AirPods each link found and how they send motion: the model number (e.g. "A3063"), its
+    name where known, and the stream kind ("raw" AirPods 3, "wx-raw" or "fused" for Pro 2 / Pro 3 /
+    4). The Pro 3 path is the least tested one: the report has to say which of them was measured.
+    Not the name the owner gave the buds (often their own name): reports get attached to bug reports."""
+    return {l.addr: {"model": getattr(l, "model", None), "model_name": getattr(l, "model_name", None),
+                     "kind": getattr(l, "model_kind", None), "stalls": getattr(l, "stalls", 0)} for l in links}
 
 
 def _wait(msg, seconds, stats, live=True):
@@ -153,6 +168,7 @@ def run_p0(backend, addrs, cfg, drift_minutes=5.0):
                        "drop_per_hour": {k: round((b0[k] - l.battery[k]) / hours, 1)
                                          for k in b0 if k in l.battery and hours > 0.05}}
     report["battery"] = bat
+    report["links"] = link_info(links)
     sides = sorted({k.split("#")[-1] for k in stats.src})
     report["answers"] = {
         "both_sides_from_one_pair": len(sides) >= 2,
@@ -161,6 +177,8 @@ def run_p0(backend, addrs, cfg, drift_minutes=5.0):
                                            for v in report["step2_on_shin_still"].values())
                                        if report["step2_on_shin_still"] else False,
     }
+    for l in links:                          # every goodbye starts at once (each stop() waits for its own)
+        l.stop_flag.set()
     for l in links:
         l.stop()
     path = C.data_path(f"p0_report_{stamp}.json")
@@ -175,6 +193,9 @@ def _print_summary(r, path):
     print("\n========== P0 結果 ==========")
     print(f"一副耳機能同時讀左右兩耳：{'是' if a['both_sides_from_one_pair'] else '否（需要第二副）'}  {a['sides_seen']}")
     print(f"綁在小腿上靜止時仍持續串流：{'是' if a['streams_while_still_on_shin'] else '否 / 不確定'}")
+    for k, v in r.get("links", {}).items():          # model and stream kind: plain data, any language
+        name = f" {v['model_name']}" if v.get("model_name") else ""
+        print(f"  {k}: {v.get('model') or '?'}{name}, {v.get('kind') or '?'}")
     for k, v in r.get("step2_on_shin_stepping", {}).items():
         print(f"  {k}: {v.get('rate_hz')} Hz, >50ms 斷訊 {v.get('gaps_over_50ms')} 次, 抖動 p95 {v.get('jitter_p95_ms')} ms")
     for k, v in r.get("step3_drift", {}).items():

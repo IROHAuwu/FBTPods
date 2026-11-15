@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 import re
 import struct
+from collections import deque
 from dataclasses import dataclass, field
 
 H = bytes.fromhex
@@ -61,8 +62,10 @@ def ctrl_cmd(ident, d1=0, d2=0, d3=0, d4=0) -> bytes:
 
 
 def rhid_sub(dev: int, kind: int, payload: bytes = b"") -> bytes:
+    # 7-bit device id: bit 6 is the side bit rhid_parse reads. Ids from announcements have it cleared
+    # already; the second-bud probe sets it on purpose (with 0x3F it was silently dropped).
     n = 4 + len(payload)
-    return struct.pack("<I", (dev & 0x3F) | ((n & 0x3FF) << 7) | ((kind & 7) << 17)) + payload
+    return struct.pack("<I", (dev & 0x7F) | ((n & 0x3FF) << 7) | ((kind & 7) << 17)) + payload
 
 
 def rhid_frame(gen: int, subpackets, side: int = 0) -> bytes:
@@ -123,8 +126,12 @@ def wx_raw_start(seq: int, interval_us: int):
     return [(wx_stream(seq, SVC_ACCEL, interval_us), 0.2), (wx_stream(seq + 1, SVC_GYRO, interval_us), 0.0)]
 
 
-def wx_raw_reports(pkt: bytes):
-    """[(service, sensor time ns, (x, y, z) scaled to g or deg/s)] from raw accel / gyro reports."""
+def wx_raw_reports(pkt: bytes, odd=None):
+    """[(service, sensor time ns, (x, y, z) scaled to g or deg/s)] from raw accel / gyro reports.
+
+    odd: optional dict that counts the reports of services 11 / 12 which do not have the layout
+    above, by (service, length, first byte). The layout comes from AirPointer and has not been
+    measured on every model: this is what a log can show when the raw stream does not work."""
     if len(pkt) < 12 or pkt[:10] != WX_PREFIX:
         return []
     n = struct.unpack_from("<H", pkt, 10)[0]
@@ -139,11 +146,20 @@ def wx_raw_reports(pkt: bytes):
                     svc = v2
                 elif f2 == 3:
                     rep = v2
-            if svc in (SVC_ACCEL, SVC_GYRO) and rep is not None and len(rep) == 28 and rep[0] == 1:
+            if svc not in (SVC_ACCEL, SVC_GYRO):
+                continue
+            # field 3 sent as a number (a status message, a damaged packet) is not a report:
+            # len() of it raised TypeError, which tore the whole link down
+            if isinstance(rep, (bytes, bytearray)) and len(rep) == 28 and rep[0] == 1:
                 stamp = struct.unpack_from("<Q", rep, 20)[0]
                 if stamp:
                     x, y, z = struct.unpack_from("<iii", rep, 1)
                     out.append((svc, stamp * 1000, (x * RAW_SCALE, y * RAW_SCALE, z * RAW_SCALE)))
+                    continue
+            if odd is not None:
+                is_bytes = isinstance(rep, (bytes, bytearray))
+                key = (svc, len(rep) if is_bytes else None, rep[0] if is_bytes and rep else None)
+                odd[key] = odd.get(key, 0) + 1
     except ValueError:
         pass
     return out
@@ -202,7 +218,8 @@ def wx_motion_blocks(pkt: bytes):
                         svc = v2
                     elif f2 == 3:
                         blk = v2
-                if blk is not None and len(blk) >= 50 and svc in (SVC_ACTIVITY, SVC_DEVMOTION6, 15):
+                if (isinstance(blk, (bytes, bytearray)) and len(blk) >= 50
+                        and svc in (SVC_ACTIVITY, SVC_DEVMOTION6, 15)):
                     out.append(bytes(blk))
     except ValueError:
         pass
@@ -302,11 +319,33 @@ class SensorTable:
         return self.devices.get(side, {}).get(name)
 
 
-# Buds without silicone tips, by model number (AirPods 1 / 2 / 3 / 4). Whatever else calls itself
+# Buds without silicone tips, by model number (AirPods 1 / 2 / 3 / 4 / 5). Whatever else calls itself
 # "... Pro" has tips. The kind of motion stream does not tell: AirPods Pro (1st generation) send raw
 # IMU like AirPods 3, AirPods 4 send the stream of the Pro 2.
 TIPLESS_MODELS = {"A1523", "A1722", "A2031", "A2032", "A2564", "A2565",
-                  "A3050", "A3053", "A3054", "A3055", "A3056", "A3057"}
+                  "A3050", "A3053", "A3054", "A3055", "A3056", "A3057",
+                  "A3531", "A3532", "A3533", "A3439", "A3440", "A3441"}
+
+# Model number of a bud (device information packet, opcode 0x1d) -> what the product is called.
+# For the log and the window: which AirPods a report came from (the Pro 3 path is untested).
+# Product names, the same in every language. A number missing here simply has no name.
+MODEL_NAMES = {
+    **dict.fromkeys(("A1523", "A1722"), "AirPods 1"),
+    **dict.fromkeys(("A2031", "A2032"), "AirPods 2"),
+    **dict.fromkeys(("A2564", "A2565"), "AirPods 3"),
+    **dict.fromkeys(("A2083", "A2084", "A2190"), "AirPods Pro"),
+    **dict.fromkeys(("A2931", "A2699", "A2698"), "AirPods Pro 2"),
+    **dict.fromkeys(("A3047", "A3048", "A3049"), "AirPods Pro 2 (USB-C)"),
+    **dict.fromkeys(("A3050", "A3053", "A3054"), "AirPods 4"),
+    **dict.fromkeys(("A3055", "A3056", "A3057"), "AirPods 4 (ANC)"),
+    **dict.fromkeys(("A3063", "A3064", "A3065"), "AirPods Pro 3"),
+    **dict.fromkeys(("A3531", "A3532", "A3533", "A3439", "A3440", "A3441"), "AirPods 5"),
+}
+
+
+def model_name(model):
+    """'A3064' -> 'AirPods Pro 3'; None for a number not in MODEL_NAMES (or no number)."""
+    return MODEL_NAMES.get(model) if isinstance(model, str) else None
 
 
 def parse_device_info(pkt: bytes):
@@ -340,23 +379,44 @@ class ImuPairer:
     the buds' own fused stream (devmotion6) point the same way (mean cosine 0.96 over a recording).
     Fed unchanged, the filter builds its world upside down; mounting calibration then hides that
     for bending forward and back, and everything else comes out mirrored: a leg moved out to the
-    side goes inwards, a foot turned out turns in. So the sign is turned here, once."""
+    side goes inwards, a foot turned out turns in. So the sign is turned here, once.
+
+    Unpaired reports wait in a short queue per kind. Keeping only the latest one lost most instants
+    when a packet carries several reports of one kind (SensorDataWX can batch them: accel packet,
+    then gyro packet), and the pairs that did form mixed instants up to a window apart."""
     ACC_SIGN = -1.0
+    QUEUE = 16                  # unpaired reports kept per (side, kind)
+    STALE_NS = 1_000_000_000    # a waiting report this far from a new one, either way, never pairs
 
     def __init__(self, window_ns=6_000_000):
-        self.last = {}              # (side, kind) -> (ts, vec)
+        self.pending = {}           # (side, kind) -> deque of (ts, vec), oldest first
         self.window = window_ns
 
     def push(self, side, kind, ts_ns, vec, arrival):
-        self.last[(side, kind)] = (ts_ns, vec)
-        other = self.last.get((side, "w" if kind == "a" else "a"))
-        if other is None or abs(other[0] - ts_ns) > self.window:
+        # A report whose partner was lost would otherwise wait for good, and when the sensor clock
+        # changes (the other bud becomes the one that streams) the new stamps would one day pass
+        # it and pair it with an instant of another bud.
+        for k in ("a", "w"):
+            q = self.pending.get((side, k))
+            while q and abs(q[0][0] - ts_ns) > self.STALE_NS:
+                q.popleft()
+        other = self.pending.get((side, "w" if kind == "a" else "a"))
+        best = None
+        for i, (t, _) in enumerate(other or ()):
+            d = abs(t - ts_ns)
+            if d <= self.window and (best is None or d < best[0]):
+                best = (d, i)
+        if best is None:
+            self.pending.setdefault((side, kind), deque(maxlen=self.QUEUE)).append((ts_ns, vec))
             return None
-        acc = vec if kind == "a" else other[1]
-        gyr = vec if kind == "w" else other[1]
-        ts = ts_ns if kind == "w" else other[0]
-        del self.last[(side, "a")]
-        del self.last[(side, "w")]
+        # the reports of the other kind that came before the match were passed over: their
+        # partner was lost, nothing later will pair with them
+        for _ in range(best[1]):
+            other.popleft()
+        o_ts, o_vec = other.popleft()
+        acc = vec if kind == "a" else o_vec
+        gyr = vec if kind == "w" else o_vec
+        ts = ts_ns if kind == "w" else o_ts
         return ImuSample(side, ts, tuple(self.ACC_SIGN * c * G for c in acc),
                          tuple(math.radians(c) for c in gyr), arrival)
 
@@ -380,7 +440,9 @@ class ProtocolState:
         self.table = SensorTable()
         self.pairer = ImuPairer()
         self.wx_pairer = ImuPairer(window_ns=12_000_000)
-        self.wx_raw_seen = False
+        self.wx_raw_seen = False   # a raw SensorDataWX accel + gyro pair was made: fused blocks unused
+        self.wx_raw_n = {}         # service -> raw reports with the expected layout (diagnostics)
+        self.wx_raw_odd = {}       # (service, length, first byte) -> raw reports with another layout
         self.kinds = {}            # (side, dev) -> 'a' | 'w'
         self.gen = 0
         self.counts = {}           # (side, dev) -> number of input reports
@@ -393,10 +455,13 @@ class ProtocolState:
     def feed(self, pkt: bytes, now: float = 0.0):
         ev = []
         if pkt[:10] == WX_PREFIX:
-            for svc, ts, vec in wx_raw_reports(pkt):
-                self.wx_raw_seen = True
+            for svc, ts, vec in wx_raw_reports(pkt, self.wx_raw_odd):
+                self.wx_raw_n[svc] = self.wx_raw_n.get(svc, 0) + 1
                 smp = self.wx_pairer.push(WX_SIDE, "a" if svc == SVC_ACCEL else "w", ts, vec, now)
                 if smp:
+                    # only a real pair proves the raw layout: one service alone (or stamps that
+                    # never match) used to latch this and throw the working fused stream away
+                    self.wx_raw_seen = True
                     ev.append(("imu", smp))
             if self.wx_raw_seen:          # raw IMU flowing: the fused stream is not used
                 return ev

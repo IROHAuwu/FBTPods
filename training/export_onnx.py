@@ -15,6 +15,18 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from airpodsvr.features import IN_DIM  # noqa: E402
 
 
+def export_kwargs(export):
+    """dynamo=False keeps the classic exporter, which newer torch no longer picks by default. Older
+    torch (2.2-2.4, still allowed by requirements.txt) has only that exporter and no such keyword:
+    passing it there stops the export with a TypeError."""
+    import inspect
+    try:
+        params = inspect.signature(export).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {"dynamo": False} if "dynamo" in params else {}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="models/pose.pt")
@@ -28,7 +40,7 @@ def main():
     h = torch.zeros(ck["layers"], 1, ck["hidden"])
     c = torch.zeros(ck["layers"], 1, ck["hidden"])
     torch.onnx.export(net, (x, h, c), a.out, input_names=["x", "h", "c"], output_names=["y", "h_out", "c_out"],
-                      opset_version=17, dynamo=False)
+                      opset_version=17, **export_kwargs(torch.onnx.export))
     print("exported", a.out)
 
 

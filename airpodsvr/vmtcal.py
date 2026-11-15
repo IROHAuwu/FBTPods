@@ -43,6 +43,11 @@ def _ang(R):
     return math.degrees(math.acos(max(-1.0, min(1.0, (float(np.trace(R)) - 1.0) / 2.0))))
 
 
+def _finite(*poses):
+    """Every (R, t) given is made of finite numbers (no NaN / inf)."""
+    return all(np.all(np.isfinite(R)) and np.all(np.isfinite(t)) for R, t in poses)
+
+
 def _ortho(R):
     u, _, vt = np.linalg.svd(R)
     R = u @ vt
@@ -74,6 +79,8 @@ class VmtCalibrator:
 
     # ---------------------------------------------------------------- measuring
     def note_sent(self, now, S):
+        if not _finite(S):           # not sent (VmtOutput skips it): nothing SteamVR could show
+            return
         self.sent.append((now, (S[0].copy(), np.asarray(S[1], float).copy())))
         while self.sent and now - self.sent[0][0] > 4.0:
             self.sent.popleft()
@@ -82,6 +89,8 @@ class VmtCalibrator:
         """O_std: the hip tracker's standing pose as SteamVR reports it, or None."""
         if O_std is None or not self.sent:
             return
+        if not _finite(O_std, raw_from_std):
+            return                   # one NaN in D would put every tracker sent from then on at NaN
         self.obs.append((now, np.asarray(O_std[1], float).copy()))
         while self.obs and now - self.obs[0][0] > 4.0:
             self.obs.popleft()
@@ -97,6 +106,8 @@ class VmtCalibrator:
         if self.stuck:
             return
         D = compose(compose(raw_from_std, O_std), inverse(S))
+        if not _finite(D):
+            return
         D = (_ortho(D[0]), D[1])
         if self.D is None or self._far(D, self.D):
             if self.candidate is not None and not self._far(D, self.candidate, 0.02, 1.0):

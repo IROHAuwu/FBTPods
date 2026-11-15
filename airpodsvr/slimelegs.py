@@ -621,10 +621,16 @@ def centre_of_mass(p_head, neck, hip, R_hip, knee, foot):
 # ------------------------------------------------------------------ the body, SlimeVR style
 class SlimeLegs:
     """Per session: one filter per bud and the leg tweaks."""
+    # No new sample for this long (the bud reconnecting, or the legs not solved meanwhile): the
+    # filter starts again at the next sample instead of predicting the whole gap once more on top.
+    # The tracker's own stale limit (LegTracker.stale): past it the legs were not shown anyway. A
+    # shorter radio hiccup while they are shown still goes through the prediction, which catches
+    # up over a few frames; restarting there would snap the leg by the whole gap in one frame.
+    FILTER_RESTART_S = 0.5
 
     def __init__(self, body, use_accel=True):
         self.body = body
-        self.filters = {}                  # role -> (PredictionFilter, last sample time seen)
+        self.filters = {}                  # role -> [PredictionFilter, last sample time seen, its fusion]
         self.tweaks = LegTweaks(body.ankle_h, body.standing_hip_y - body.ankle_h)
         self.use_accel = use_accel
         self.own = {leg: LegState() for leg in LEGS}     # our own solver's state, for legs without a thigh bud
@@ -635,12 +641,17 @@ class SlimeLegs:
     def segment(self, tr, dt):
         """A tracker's segment rotation through the prediction filter."""
         entry = self.filters.get(tr.role)
-        if entry is None:
-            entry = self.filters[tr.role] = [PredictionFilter(), None]
+        if entry is None or entry[2] is not tr.fusion:
+            # new, or the bud's fusion was started again (e.g. its gyro axes were corrected): its
+            # attitude jumps, and that jump is no motion to predict
+            entry = self.filters[tr.role] = [PredictionFilter(), None, tr.fusion]
         flt = entry[0]
         if entry[1] != tr.last_update:
+            if entry[1] is not None and tr.last_update - entry[1] > self.FILTER_RESTART_S:
+                flt.reset(tr.fusion.R_ws)
+            else:
+                flt.add(tr.fusion.R_ws)
             entry[1] = tr.last_update
-            flt.add(tr.fusion.R_ws)
         R = flt.update(dt)
         if R is None:
             R = tr.fusion.R_ws

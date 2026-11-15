@@ -26,7 +26,8 @@ def load_frames(path):
             if not line.strip():
                 continue
             row = json.loads(line)
-            if row.get("dir", "rx") == "rx":
+            # mark lines ({"t", "mark"}, AirPodsLink.mark in probe recordings) carry no packet
+            if isinstance(row, dict) and "hex" in row and row.get("dir", "rx") == "rx":
                 frames.append((float(row["t"]), bytes.fromhex(row["hex"])))
     return frames
 

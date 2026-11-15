@@ -89,6 +89,18 @@ def run(out, srv, trackers, seconds=0.5, batteries=None, fresh=True):
     srv.pump()
 
 
+def quiet_for(sock, quiet=0.05):
+    """Reads (and drops) what waits in a socket until nothing more came for `quiet` seconds."""
+    sock.setblocking(False)
+    end = time.monotonic() + quiet
+    while time.monotonic() < end:
+        try:
+            if sock.recvfrom(512):
+                end = time.monotonic() + quiet
+        except (BlockingIOError, ConnectionError):
+            time.sleep(0.002)
+
+
 def test_buds_appear_as_slimevr_trackers():
     srv = FakeServer()
     out = SlimeOutput("127.0.0.1", srv.port)
@@ -121,8 +133,10 @@ def test_quiet_bud_does_not_time_out_and_server_restart_is_followed():
     assert 2 <= dev["rots"] - n <= 6
     # the server goes away and comes back: a new handshake, without restarting FBT Pods
     d = out.devices["AA:BB:CC:10:20:00#0"]
-    d.rx_t -= 10
-    srv.devices.clear()
+    srv.keepup()                                                  # its last heartbeat, still on the way
+    srv.devices.clear()                                           # it sends nothing more from now on
+    quiet_for(d.sock)                                             # ... and what it sent before is read
+    d.rx_t -= 10                                                  # (a heartbeat read later would undo this)
     run(out, srv, src, 1.5)
     assert out.connected == 1 and len(srv.devices) == 1
 
