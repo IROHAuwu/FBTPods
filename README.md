@@ -78,7 +78,7 @@ Strap AirPods to your legs and they become trackers for VRChat and other SteamVR
 
 ## Quick start
 
-1. Download `FBT_Pods_v1.zip` from [Releases](https://github.com/IROHAuwu/fbtpods/releases) and unzip **the whole folder** anywhere.
+1. Download the latest `FBT_Pods_v….zip` from [Releases](https://github.com/IROHAuwu/fbtpods/releases) and unzip **the whole folder** anywhere.
 2. Double-click `FBTPods.exe`.
 3. On **Overview**, turn every item green:
 

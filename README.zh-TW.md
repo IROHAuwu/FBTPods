@@ -78,7 +78,7 @@
 
 ## 開始使用
 
-1. 到 [Releases](https://github.com/IROHAuwu/fbtpods/releases) 下載 `FBT_Pods_v1.zip`，**整個資料夾**解壓到任何位置。
+1. 到 [Releases](https://github.com/IROHAuwu/fbtpods/releases) 下載最新的 `FBT_Pods_v….zip`，**整個資料夾**解壓到任何位置。
 2. 雙擊 `FBTPods.exe`。
 3. 在「總覽」頁把每個項目變成綠燈：
 
