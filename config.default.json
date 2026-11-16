@@ -41,5 +41,6 @@
   "leg_model": 0,
   "stem_actions": true,
   "ear_detection_off": false,
-  "demo_sensors": 2
+  "demo_sensors": 2,
+  "controller_direct_buttons": true
 }

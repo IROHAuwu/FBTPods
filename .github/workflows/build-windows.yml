@@ -48,6 +48,16 @@ jobs:
           & dist\FBTPods\runtime\python.exe -c "import sys; sys.path.insert(0, r'dist\FBTPods\app'); import airpodsvr, numpy, bumble, vqf, openvr, pythonosc, webview, pystray; from airpodsvr.version import text; print(text())"
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
+      # FBTPods.exe itself: a PYTHONHOME left by another Python must not stop the bundled runtime, and
+      # a file named on the command line is found in the folder the command was typed in
+      - name: The launcher runs a terminal command
+        shell: pwsh
+        timeout-minutes: 3        # on an error the launcher waits for Enter in its console
+        run: |
+          $env:PYTHONHOME = "C:\no-such-python"
+          $p = Start-Process dist\FBTPods\FBTPods.exe -ArgumentList "replay", "tests\data\airpods3_raw_imu.json" -WorkingDirectory $PWD -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Write-Host "FBTPods.exe replay: exit code $($p.ExitCode)"; exit 1 }
+
       - uses: actions/upload-artifact@v4
         with:
           name: FBTPods-portable
@@ -73,7 +83,7 @@ jobs:
           if ($LASTEXITCODE -eq 0) { Write-Host "release $tag exists already"; exit 0 }
           $name = "FBT_Pods_$tag"
           Copy-Item dist\FBTPods-portable.zip "dist\$name.zip"
-          $notes = "Windows portable build: download $name.zip, unzip the whole folder and run FBTPods.exe.`n`nInterface: English (default), Traditional Chinese, Japanese, Korean (Settings > Language).`n`nSetup: https://github.com/$env:GITHUB_REPOSITORY#readme"
+          $notes = "Windows portable build: download $name.zip, unzip the whole folder and run FBTPods.exe.`n`nInterface: English (default), Traditional Chinese, Japanese, Korean, Spanish (Settings > Language).`n`nSetup: https://github.com/$env:GITHUB_REPOSITORY#readme"
           gh release create $tag "dist\$name.zip" --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title $name --notes $notes
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
@@ -122,7 +132,9 @@ jobs:
         shell: pwsh
         run: |
           if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) { choco install innosetup -y --no-progress }
-          $ver = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME.TrimStart("v") } else { "0.1.0" }
+          # the app's own version (airpodsvr.__version__, in build_info.json), as the window shows it;
+          # release tags (v1) are names for a download, not versions
+          $ver = (Get-Content build_info.json -Raw | ConvertFrom-Json).version
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$ver" packaging\installer.iss
 
       - uses: actions/upload-artifact@v4

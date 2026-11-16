@@ -3,8 +3,15 @@
 // Uses $, $$, api, toast from app.js.
 
 window.Sensors = (() => {
-  const EAR = { 0: "在耳內", 1: "離耳", 2: "在盒內" };
-  const KIND = { raw: "原始 IMU", fused: "融合姿態" };
+  // 3: in the case with the lid closed, where the unused bud of a pair is asked to go
+  const EAR = { 0: "在耳內", 1: "離耳", 2: "在盒內", 3: "在盒內（蓋上）" };
+  const ear = v => EAR[v] || "?";
+  // the motion stream a bud sends: RemoteHID raw IMU (AirPods 3), SensorDataWX raw accelerometer and
+  // gyroscope (Pro 2 / Pro 3 / 4), or SensorDataWX attitude (about 100 Hz measured on Pro 2 USB-C / Pro 3); the measured rate is
+  // in the badge next to it
+  const KIND = { raw: "原始 IMU", "wx-raw": "原始 IMU（Pro／4，實驗性）", fused: "融合姿態" };
+  const KIND_HELP = { raw: "原始 IMU 約 100 Hz", "wx-raw": "原始 IMU（Pro／4，實驗性）", fused: "融合姿態約 100 Hz（實驗性）" };
+  const fix = (x, d) => typeof x === "number" && isFinite(x) ? x.toFixed(d) : "–";
   const COL = ["#0a84ff", "#30d158", "#ff9f0a"];
   const WINDOW = 6;                       // seconds of gyro trace
   let shown = false, timer = null, seq = 0, mode = null, busy = false;
@@ -19,8 +26,10 @@ window.Sensors = (() => {
   }
   const T = A => [[A[0][0], A[1][0], A[2][0]], [A[0][1], A[1][1], A[2][1]], [A[0][2], A[1][2], A[2][2]]];
   // AirPods 3 send raw IMU over RemoteHID; the buds that use SensorDataWX are the Pro family
-  // the buds say which model they are (AirPods Pro of the 1st generation send raw IMU too)
-  const shapeOf = b => (b && b.shape) || ((!b || !b.kind || b.kind === "raw") ? "a3" : "pro");
+  // the buds say which model they are (AirPods Pro of the 1st generation send raw IMU too). Without
+  // that, the stream decides: the samples of "wx-raw" look like plain raw ones, but only the Pro
+  // family sends them, so a Pro 3 on that path was drawn as an AirPods 3
+  const shapeOf = b => (b && b.shape) || ((!b || !(b.stream || b.kind) || (b.stream || b.kind) === "raw") ? "a3" : "pro");
   // left or right: what the user marked, else what the buds report about themselves
   const sideOf = b => (b && (b.name === "left" || b.name === "right")) ? b.name : (b && b.primary) || null;
 
@@ -99,7 +108,9 @@ window.Sensors = (() => {
     $("#sens-mode").textContent = d.error ? d.error :
       ({ live: "測試中：直接連線 AirPods", tap: "追蹤進行中：顯示追蹤用的耳機", sim: "模擬資料" }[mode] || "尚未開始");
     $("#sens-mode").classList.toggle("err", !!d.error);
-    $("#sens-links").textContent = (d.links || []).map(l => `${l.addr.slice(-5)} ${linkZh(l.status)}`).join("　");
+    // each connection with what the buds are and which stream they send (which path a Pro 3 is on)
+    $("#sens-links").textContent = (d.links || []).map(l => [`${l.addr.slice(-5)} ${linkZh(l.status)}`,
+      l.model_name, KIND[l.kind]].filter(Boolean).join(" · ")).join("　");
     seq = d.seq || seq;
     const host = $("#sens-buds");
     // three or four buds: compact cards, two to a row, so that every model is in view at once
@@ -149,16 +160,21 @@ window.Sensors = (() => {
       : `${side === "left" ? "左耳" : "右耳"} …${b.addr.slice(-5)}（耳機回報）`;
     $(".bud-addr", el).textContent = `${b.addr} · side ${b.side}` + (b.model ? ` · ${b.model}` : "");
     const badges = [];
-    badges.push(b.streaming ? `<span class="badge ok">傳送中</span>` : `<span class="badge bad">無資料 ${b.age > 99 ? "" : `${b.age.toFixed(0)} 秒`}</span>`);
-    if (b.kind) badges.push(`<span class="badge">${KIND[b.kind]}</span>`);
-    badges.push(`<span class="badge">${b.rate.toFixed(0)} Hz</span>`);
-    if (b.ear_pair) badges.push(`<span class="badge ${b.both_out ? "warn" : ""}" title="這副 AirPods 的入耳偵測">主耳 ${EAR[b.ear_pair[0]]}／副耳 ${EAR[b.ear_pair[1]]}</span>`);
+    badges.push(b.streaming ? `<span class="badge ok">傳送中</span>` : `<span class="badge bad">無資料 ${b.age > 99 ? "" : `${fix(b.age, 0)} 秒`}</span>`);
+    // the model the buds report (e.g. AirPods Pro 3), then the stream it sends and its measured rate
+    if (b.model_name) badges.push(`<span class="badge">${esc(b.model_name)}</span>`);
+    const kind = b.stream || b.kind;
+    if (KIND[kind]) badges.push(`<span class="badge" title="${KIND_HELP[kind]}">${KIND[kind]}</span>`);
+    badges.push(`<span class="badge">${fix(b.rate, 0)} Hz</span>`);
+    if (b.ear_pair) badges.push(`<span class="badge ${b.both_out ? "warn" : ""}" title="這副 AirPods 的入耳偵測">主耳 ${ear(b.ear_pair[0])}／副耳 ${ear(b.ear_pair[1])}</span>`);
     if (b.battery != null) badges.push(`<span class="badge">🔋 ${b.battery}%</span>`);
-    $(".bud-badges", el).innerHTML = badges.join("");
+    const html = badges.join("");
+    // (compared with what was written, not with the page: the page holds the translated text)
+    if (st.badgesHtml !== html) { st.badgesHtml = html; $(".bud-badges", el).innerHTML = html; }
     $(".bud-move", el).classList.toggle("on", b.gyro_dps > 30);
     $(".bud-stats", el).innerHTML = [
-      `角速度 <b>${b.gyro_dps.toFixed(0)}</b> °/s`,
-      b.acc_g != null ? `加速度 <b>${b.acc_g.toFixed(2)}</b> g` : "",
+      `角速度 <b>${fix(b.gyro_dps, 0)}</b> °/s`,
+      b.acc_g != null ? `加速度 <b>${fix(b.acc_g, 2)}</b> g` : "",
       `樣本 <b>${b.samples}</b>`,
       b.rest ? `<span class="ok-t">靜止</span>` : "",
     ].filter(Boolean).join("　");
@@ -180,7 +196,7 @@ window.Sensors = (() => {
 
   const fmt = v => (v >= 0 ? "+" : "") + v.toFixed(0);
   const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
-  const linkZh = s => ({ streaming: "串流中", connecting: "連線中", "waiting for sensors": "等待感測器", stopped: "已停止", stalled: "資料中斷，重試中", "needs pairing": "需要重新配對" }[s] || s);
+  const linkZh = s => ({ streaming: "串流中", connecting: "連線中", "waiting for sensors": "等待感測器", stopped: "已停止", stalled: "資料中斷，重試中", "needs pairing": "需要重新配對", "adapter lost": "USB藍芽已中斷：插回後請停止再開始追蹤" }[s] || s);
 
   // the 3D models come from other people's work: say whose (their licences ask for it). Shown with
   // the other licences, on the Advanced page; NOTICE below it has the links and the changes made.
@@ -201,8 +217,9 @@ window.Sensors = (() => {
       const yaw = deg(Math.atan2(D[0][2], D[2][2])), pitch = deg(Math.asin(Math.max(-1, Math.min(1, -D[1][2]))));
       const roll = deg(Math.atan2(D[1][0], D[1][1]));
       const txt = `<span>左右轉 <b>${fmt(yaw)}°</b></span><span>上下 <b>${fmt(pitch)}°</b></span><span>側傾 <b>${fmt(roll)}°</b></span>`;
-      const yel = $(".bud-ypr", st.el);
-      if (yel.innerHTML !== txt) yel.innerHTML = txt;
+      // compared with what was written last, not with the page: in any language but Chinese the
+      // page holds the translated labels, so it never matched and was rebuilt every frame
+      if (st.yprTxt !== txt) { st.yprTxt = txt; $(".bud-ypr", st.el).innerHTML = txt; }
       drawChart($(".cvch", st.el), st.hist);
     }
     requestAnimationFrame(render);

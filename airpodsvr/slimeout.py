@@ -22,7 +22,8 @@ every packet from a tracker is  int32 id, int64 packet number, payload:
                    then does that for ALL trackers (after the delay set in its own settings).
 
 One UDP socket per bud: the server tells devices apart by address and port. A device silent for a
-second is shown as timed out, so the last orientation is repeated while a bud is quiet.
+second is shown as timed out, so the last orientation is repeated while a bud is quiet. A bud that
+is no longer sent at all (in the case) is left to time out; its socket is kept for its return.
 
 Axes: the server turns what it receives by -90 degrees about X (firmware world: Z up) to get its own
 Y-up world. Our fusion's world is Y up already (math3d.E2W, the same turn), so the turn is undone
@@ -85,6 +86,7 @@ class SlimeDevice:
         self.rx_t = -1e9                 # last packet from the server
         self.tx_t = -1e9                 # last rotation sent
         self.q = None                    # last quaternion sent (x, y, z, w)
+        self.bad_since = None            # orientations given since then were not finite (not sent)
         self.battery = None
         self.battery_t = -1e9
 
@@ -141,14 +143,37 @@ class SlimeDevice:
             self._send(SENSOR_INFO, bytes([0, 1, 0]))
         return fresh
 
+    def drain(self):
+        """Drops what waits in the socket, unanswered (it came while this bud was away)."""
+        for _ in range(10000):           # (bounded: a socket that only ever fails must not hang the loop)
+            try:
+                self.sock.recvfrom(256)
+            except (BlockingIOError, InterruptedError):
+                return                   # nothing more
+            except OSError:
+                # Windows reports a packet sent to a closed port (no server then) as a "connection
+                # reset" here, in turn with what arrived: stopping at it left the server's old
+                # answers behind, to be taken for new ones
+                continue
+
     def rotation(self, now, R_ws=None):
+        """Sends R_ws (None: the last orientation again). A non-finite R_ws (NaN / inf from a
+        numeric corner case upstream) is not sent and returns False: the last good one stays."""
         if R_ws is not None:
-            w, x, y, z = mat_to_quat(E2W.T @ np.asarray(R_ws, float))
+            R = np.asarray(R_ws, float)
+            q = mat_to_quat(E2W.T @ R) if np.all(np.isfinite(R)) else None
+            if q is None or not np.all(np.isfinite(q)):
+                if self.bad_since is None:
+                    self.bad_since = now
+                return False
+            w, x, y, z = q
             self.q = (float(x), float(y), float(z), float(w))
+            self.bad_since = None
         if not self.connected or self.q is None:
-            return
+            return True
         self.tx_t = now
         self._send(ROTATION, bytes([0, 1]) + struct.pack(">ffff", *self.q) + b"\x00")
+        return True
 
     def set_battery(self, now, level):
         """level: 0..100, or None."""
@@ -168,55 +193,90 @@ class SlimeDevice:
 
 class SlimeOutput:
     KEEPALIVE_S = 0.25            # a quiet bud: its last orientation again, so that it does not time out
+    BAD_HOLD_S = 1.0              # non-finite orientations this long: the last good one is not repeated any more
+    SKIP_LOG_S = 10.0             # a skipped orientation is logged at most this often per bud
 
     def __init__(self, host="127.0.0.1", port=6969):
         self.server = (host, int(port))
-        self.devices = {}             # source -> SlimeDevice
+        self.devices = {}             # source -> SlimeDevice, the buds being sent
+        self.away = {}                # source -> SlimeDevice no longer sent (socket kept for its return)
         self.said = None
+        self._state = None            # what state() said last
+        self._skipped = {}            # source -> (orientations not sent, when that was last logged)
 
     def device(self, source):
         d = self.devices.get(source)
         if d is None:
-            d = self.devices[source] = SlimeDevice(source, self.server)
-            log.info("SlimeVR output: %s as tracker %s", source, mac_text(d.mac))
+            d = self.away.pop(source, None)
+            if d is not None:
+                d.drain()             # back: what the server sent meanwhile is old news
+                log.info("SlimeVR output: %s sent again", source)
+            else:
+                d = SlimeDevice(source, self.server)
+                log.info("SlimeVR output: %s as tracker %s", source, mac_text(d.mac))
+            self.devices[source] = d
         return d
 
     def update(self, now, trackers, batteries=None):
         """trackers: {source: (R_ws, fresh)}: sensor -> world (Y up) and whether it is new data.
-        batteries: {source: 0..100}."""
+        batteries: {source: 0..100}. A bud left out is away (back in the case, out of range)."""
+        for source in [s for s in self.devices if s not in trackers]:
+            # Not polled any more, so its tracker times out in the server (answering the server's
+            # heartbeats would keep it alive there, frozen). Nor counted as connected, nor used
+            # for user_action(): a server restarted meanwhile no longer knows its address.
+            d = self.away[source] = self.devices.pop(source)
+            d.connected = d.sensor_ok = False
+            log.info("SlimeVR output: %s not sent any more", source)
         for source, (R_ws, fresh) in trackers.items():
             d = self.device(source)
             if d.poll(now):
                 log.info("SlimeVR Server accepted %s (%s)", source, mac_text(d.mac))
-            if fresh:
-                d.rotation(now, R_ws)
-            elif now - d.tx_t > self.KEEPALIVE_S:
+            took = fresh and d.rotation(now, R_ws)
+            if fresh and not took:
+                self._skip(source, now)
+            if not took and now - d.tx_t > self.KEEPALIVE_S and (
+                    d.bad_since is None or now - d.bad_since < self.BAD_HOLD_S):
+                # quiet, or a non-finite orientation skipped: the last good one again. Not for
+                # long after the bud only gives broken ones: then the server shows it timed out,
+                # not a leg frozen in place.
                 d.rotation(now)
             d.set_battery(now, (batteries or {}).get(source))
 
+    def _skip(self, source, now):
+        n, t = self._skipped.get(source, (0, -1e9))
+        if now - t >= self.SKIP_LOG_S:
+            log.warning("SlimeVR output: %s orientation not finite, not sent (%d so far)", source, n + 1)
+            t = now
+        self._skipped[source] = (n + 1, t)
+
     def user_action(self, kind):
-        """Asks the server for a reset (or pause) the way a tracker's button does. True if sent."""
-        for d in self.devices.values():
-            if d.connected:
-                d._send(USER_ACTION, bytes([kind]))
-                return True
-        return False
+        """Asks the server for a reset (or pause) the way a tracker's button does. True if sent.
+        Through the bud the server was heard from last: the server does it for every tracker."""
+        live = [d for d in self.devices.values() if d.connected]
+        if not live:
+            return False
+        max(live, key=lambda d: d.rx_t)._send(USER_ACTION, bytes([kind]))
+        return True
 
     @property
     def connected(self):
-        return sum(1 for d in self.devices.values() if d.connected)
+        # (a copy: the window's status, from another thread, reads this while update() moves buds
+        # in and out of `devices`)
+        return sum(1 for d in list(self.devices.values()) if d.connected)
 
     def state(self, now):
-        """None (nothing to send yet) | "ok" | "partial" | "waiting" (no answer from the server)."""
+        """None (nothing to send yet) | "ok" | "partial" | "waiting" (no answer from the server).
+        Only the buds being sent count. With every bud away there is no news: the last state stands
+        (a "waiting" for the moment of their return would be announced as the server not answering)."""
         old = [d for d in self.devices.values() if now - d.hello_t < 1e8]
         if not old:
-            return None
+            return self._state if self.away else None
         n = self.connected
-        if n == len(self.devices):
-            return "ok"
-        return "partial" if n else "waiting"
+        self._state = "ok" if n == len(self.devices) else ("partial" if n else "waiting")
+        return self._state
 
     def close(self):
-        for d in self.devices.values():
+        for d in list(self.devices.values()) + list(self.away.values()):
             d.close()
         self.devices.clear()
+        self.away.clear()

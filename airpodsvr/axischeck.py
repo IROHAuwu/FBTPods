@@ -18,8 +18,6 @@ import math
 
 import numpy as np
 
-from .math3d import axis_angle
-
 log = logging.getLogger(__name__)
 
 
@@ -36,6 +34,33 @@ def _candidates():
 
 CANDIDATES = _candidates()
 IDENTITY = next(i for i, M in enumerate(CANDIDATES) if np.allclose(M, np.eye(3)))
+_STACK = np.array(CANDIDATES)                       # (48, 3, 3)
+_PROPER = np.linalg.det(_STACK) > 0                 # rotations; the other 24 are mirrorings
+
+
+def _integrate(dts, W):
+    """R = A_0 @ A_1 @ ... @ A_n-1 with A_i the rotation by W[i] * dts[i] (the gyro integrated over a
+    motion), computed in a few batched numpy steps instead of one Python step per sample: the
+    products are taken pairwise, keeping their order."""
+    n = np.linalg.norm(W, axis=1)
+    ang = n * dts
+    moved = ang > 1e-9
+    a = np.zeros_like(W)
+    a[moved] = W[moved] / n[moved, None]
+    K = np.zeros((len(W), 3, 3))
+    K[:, 0, 1], K[:, 0, 2] = -a[:, 2], a[:, 1]
+    K[:, 1, 0], K[:, 1, 2] = a[:, 2], -a[:, 0]
+    K[:, 2, 0], K[:, 2, 1] = -a[:, 1], a[:, 0]
+    s = np.where(moved, np.sin(ang), 0.0)[:, None, None]
+    c = np.where(moved, 1.0 - np.cos(ang), 0.0)[:, None, None]
+    A = np.eye(3) + s * K + c * (K @ K)
+    if not len(A):
+        return np.eye(3)
+    while len(A) > 1:
+        if len(A) % 2:
+            A = np.concatenate([A, np.eye(3)[None]])
+        A = A[0::2] @ A[1::2]
+    return A[0]
 
 
 class GyroAxisCheck:
@@ -54,6 +79,7 @@ class GyroAxisCheck:
         self.errors = np.zeros(len(CANDIDATES))
         self.episodes = 0
         self.result = None         # 3x3 mapping once decided (may be the identity)
+        self.sure = False          # decided by the scores, not by giving up after 12 episodes
         self.report = ""
 
     def feed(self, dt, acc, gyr):
@@ -88,16 +114,16 @@ class GyroAxisCheck:
         tilt = math.acos(max(-1.0, min(1.0, float(g0 @ g1))))
         if total < self.MIN_TURN or tilt < self.MIN_TURN:
             return
-        errs = np.empty(len(CANDIDATES))
-        for i, M in enumerate(CANDIDATES):
-            R = np.eye(3)
-            for dt, w in self.motion:
-                v = M @ w
-                a = float(np.linalg.norm(v)) * dt
-                if a > 1e-9:
-                    R = R @ axis_angle(v, a)
-            pred = R.T @ g0
-            errs[i] = math.degrees(math.acos(max(-1.0, min(1.0, float(pred @ g1)))))
+        # This runs inside the tracker update, under the lock the 90 Hz output loop also needs:
+        # integrating the motion once per candidate (48 x up to 600 samples in Python) froze every
+        # tracker for 0.1-0.6 s. A candidate M only relabels the axes, and turning the gyro by M
+        # turns each step by M too: exp([M w]x) = M exp(det(M) [w]x) M^T. So the motion is integrated
+        # twice (gyro as read, and negated for the mirrorings) and each candidate is a conjugation.
+        dts = np.array([dt for dt, _ in self.motion], float)
+        W = np.array([w for _, w in self.motion], float)
+        R_s = np.where(_PROPER[:, None, None], _integrate(dts, W)[None], _integrate(dts, -W)[None])
+        pred = _STACK @ np.swapaxes(R_s, 1, 2) @ np.swapaxes(_STACK, 1, 2) @ g0      # (M R M^T)^T g0
+        errs = np.degrees(np.arccos(np.clip(pred @ g1, -1.0, 1.0)))
         self.errors += errs
         self.episodes += 1
         if self.episodes >= self.EPISODES:
@@ -110,9 +136,9 @@ class GyroAxisCheck:
         self.report = (f"gyro axes: identity {ident:.1f} deg, best {mean[best]:.1f} deg "
                        f"{CANDIDATES[best].astype(int).tolist()} over {self.episodes} episodes")
         if best == IDENTITY or ident < 8.0:
-            self.result = np.eye(3)
+            self.result, self.sure = np.eye(3), True
         elif mean[best] < 8.0 and ident > 2.5 * mean[best] + 6.0:
-            self.result = CANDIDATES[best].copy()
+            self.result, self.sure = CANDIDATES[best].copy(), True
         else:                                          # not clear yet: keep collecting
             if self.episodes >= 12:
                 self.result = np.eye(3)

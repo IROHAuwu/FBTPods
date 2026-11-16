@@ -19,6 +19,7 @@ class Tray:
         self.ctl, self.on_show, self.on_quit = ctl, on_show, on_quit
         self.icon = None
         self.told = False
+        self.menu_shown = None        # (start / stop label, can it be pressed) the menu was last built with
 
     def start(self):
         try:
@@ -35,7 +36,7 @@ class Tray:
         menu = pystray.Menu(
             pystray.MenuItem(lambda it: tr("開啟 FBT Pods"), lambda i, it: self.on_show(), default=True),
             pystray.MenuItem(lambda it: tr("停止追蹤" if ctl.running else "開始追蹤"), toggle,
-                             enabled=lambda it: ctl.running or ctl.ready_to_run()),
+                             enabled=lambda it: self.can_toggle()),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda it: tr("結束 FBT Pods"), lambda i, it: self.on_quit()))
         try:
@@ -47,6 +48,15 @@ class Tray:
             return False
         return True
 
+    def can_toggle(self):
+        """Stopping is always offered. Starting needs a finished setup, and no setup step that has
+        the Bluetooth adapter open (pairing, preparing it): the window's modal dialog keeps its own
+        start button out of reach then, the menu has to as well."""
+        ctl = self.ctl
+        if ctl.running:
+            return True
+        return bool(ctl.ready_to_run()) and not ctl.setup_holds_dongle()
+
     @property
     def active(self):
         return self.icon is not None
@@ -56,6 +66,17 @@ class Tray:
             title = tr("FBT Pods — 追蹤中") if self.ctl.running else "FBT Pods"
             if self.icon.title != title:
                 self.icon.title = title
+            # On Windows the menu is built once and that copy is shown: the start / stop item's label
+            # and whether it can be pressed were only looked at again after a click in the menu. It
+            # could say 開始追蹤 while tracking ran (and a click stopped it), or stay pressable while
+            # pairing had the Bluetooth adapter. Built again whenever that item changes.
+            menu = (tr("停止追蹤" if self.ctl.running else "開始追蹤"), self.can_toggle())
+            if menu != self.menu_shown:
+                self.menu_shown = menu
+                try:
+                    self.icon.update_menu()
+                except Exception as e:   # noqa: BLE001
+                    log.debug("tray menu: %s", e)
 
     def notify_hidden(self, why="tracking"):
         """Once per run: tell where the program went when its window was closed."""

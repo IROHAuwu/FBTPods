@@ -35,6 +35,10 @@ PBS_URL = ("https://github.com/astral-sh/python-build-standalone/releases/downlo
            "cpython-3.12.10+20250409-x86_64-pc-windows-msvc-install_only.tar.gz")
 # Portable layout: only FBTPods.exe at the top; everything else under app\ and runtime\.
 APP_ITEMS = ["airpodsvr", "steamvr", "models", "firmware", "config.default.json"]
+# Model weights are never shipped: pose.pt / pose.onnx are trained on AMASS, whose licence forbids
+# passing them on, and the HMD-Poser checkpoint is downloaded by the app when the user asks for it.
+# A model someone trained for themselves is loaded from their own models\ folder, not from the zip.
+APP_IGNORE = ("__pycache__", "README.md", "*.pt", "*.onnx")
 LICENCE_ITEMS = ["NOTICE", "LICENSE"]
 CONSTRAINTS = os.path.join(ROOT, "packaging", "constraints.txt")
 
@@ -55,14 +59,35 @@ def write_build_file(folder):
     """build_info.json: which code this is; shown in the window and put into diagnostics.
     (Not named BUILD: on Windows that is the same name as PyInstaller's build\\ folder.)"""
     import json
-    import re
     import time
-    with open(os.path.join(ROOT, "airpodsvr", "__init__.py"), encoding="utf-8") as f:
-        version = re.search(r'__version__ = "([^"]+)"', f.read()).group(1)
-    info = {"version": version, "commit": git_commit(), "built": time.strftime("%Y-%m-%d")}
+    info = {"version": app_version(), "commit": git_commit(), "built": time.strftime("%Y-%m-%d")}
     with open(os.path.join(folder, "build_info.json"), "w", encoding="utf-8") as f:
         json.dump(info, f)
     return info
+
+
+def app_version():
+    """airpodsvr.__version__, read from the source: the one place the version is written."""
+    import re
+    with open(os.path.join(ROOT, "airpodsvr", "__init__.py"), encoding="utf-8") as f:
+        return re.search(r'__version__ = "([^"]+)"', f.read()).group(1)
+
+
+def versioned_rc(src, dest, version):
+    """Copy of icon.rc whose version fields say `version` (the app's __version__), so the
+    launcher's Properties > Details show the same version as the window and the installer."""
+    import re
+    nums = [int(x) for x in re.match(r"[0-9.]*", version).group(0).split(".") if x][:4]
+    nums += [0] * (4 - len(nums))
+    with open(src, encoding="utf-8") as f:
+        text = f.read()
+    text = re.sub(r"^(FILEVERSION|PRODUCTVERSION)\s.*$", lambda m: m.group(1) + " " + ",".join(map(str, nums)),
+                  text, flags=re.M)
+    text = re.sub(r'(VALUE "(?:FileVersion|ProductVersion)", )"[^"]*"', lambda m: m.group(1) + '"' + version + '"',
+                  text)
+    with open(dest, "w", encoding="utf-8") as f:
+        f.write(text)
+    return dest
 
 
 def build_launcher(dest, tmp):
@@ -72,7 +97,11 @@ def build_launcher(dest, tmp):
     pk = os.path.join(ROOT, "packaging")
     zig = [sys.executable, "-m", "ziglang"]
     res = os.path.join(tmp, "icon.res")
-    subprocess.check_call(zig + ["rc", "/fo", res, "icon.rc"], cwd=pk)
+    # the version-stamped resource script and its icon side by side in tmp: its "icon.ico" is found
+    # whether rc looks next to the script or in the working folder
+    shutil.copy2(os.path.join(pk, "icon.ico"), tmp)
+    versioned_rc(os.path.join(pk, "icon.rc"), os.path.join(tmp, "icon.rc"), app_version())
+    subprocess.check_call(zig + ["rc", "/fo", res, "icon.rc"], cwd=tmp)
     subprocess.check_call(zig + ["cc", "-target", "x86_64-windows-gnu", "-municode", "-O2",
                                  "-Wl,--subsystem,windows", os.path.join(pk, "launcher.c"), res,
                                  "-lshlwapi", "-o", dest])
@@ -116,8 +145,26 @@ def main():
     if os.path.exists(out):
         shutil.rmtree(out)
     os.makedirs(out)
+    # downloads (the Python runtime, wheels) go to a folder that is removed afterwards, also when
+    # the build fails: every local build used to leave tens of MB behind in %TEMP%
     tmp = tempfile.mkdtemp()
+    try:
+        build(a, pins, out, tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
+
+def copy_app_files(app, root=ROOT):
+    """The program files (APP_ITEMS) into app\\, without caches, READMEs and model weights."""
+    for item in APP_ITEMS:
+        src = os.path.join(root, item)
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(app, item), ignore=shutil.ignore_patterns(*APP_IGNORE))
+        elif os.path.exists(src):
+            shutil.copy2(src, app)
+
+
+def build(a, pins, out, tmp):
     # 1. Python runtime
     tar = a.python_tar or fetch(PBS_URL, os.path.join(tmp, "python.tar.gz"))
     with tarfile.open(tar) as t:
@@ -168,19 +215,17 @@ def main():
         f.write("\n".join(versions) + "\n")
 
     # 3. app files
-    for item in APP_ITEMS:
-        src = os.path.join(ROOT, item)
-        if os.path.isdir(src):
-            shutil.copytree(src, os.path.join(app, item),
-                            ignore=shutil.ignore_patterns("__pycache__", "*.pt", "README.md"))
-        elif os.path.exists(src):
-            shutil.copy2(src, app)
+    copy_app_files(app)
     os.makedirs(os.path.join(app, "licenses"), exist_ok=True)
     for item in LICENCE_ITEMS:
         shutil.copy2(os.path.join(ROOT, item), os.path.join(app, "licenses", item))
     if a.build_launcher:
         build_launcher(os.path.join(out, "FBTPods.exe"), tmp)
     else:
+        # the committed binary was compiled once by hand and is not rebuilt with launcher.c: only
+        # --build-launcher (what the release workflow uses) ships the launcher this source describes
+        print("note: FBTPods.exe copied from packaging/bin (prebuilt, may be older than launcher.c); "
+              "--build-launcher compiles launcher.c")
         shutil.copy2(os.path.join(ROOT, "packaging", "bin", "FBTPods.exe"), out)
     print("build:", write_build_file(app))
 

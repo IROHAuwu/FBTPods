@@ -23,7 +23,8 @@ from .math3d import axis_angle, rot_y
 log = logging.getLogger(__name__)
 
 HIST = 900                      # gyro points kept per bud (~8 s at 110 Hz)
-EAR_ZH = {0: "在耳內", 1: "離耳", 2: "在盒內"}
+# 3: in the case with the lid closed, which is where the unused bud of a pair is asked to go
+EAR_ZH = {0: "在耳內", 1: "離耳", 2: "在盒內", 3: "在盒內（蓋上）"}
 
 
 class BudView:
@@ -116,8 +117,8 @@ class SensorMonitor:
         n.update(C.load_config().get("bud_names", {}))
         return n
 
-    def label(self, src):
-        names = self.names()
+    def label(self, src, names=None):
+        names = self.names() if names is None else names   # snapshot() passes its own: no config read under self.lock
         n = names.get(src)
         if n:
             return {"left": "左耳", "right": "右耳"}.get(n, n)
@@ -138,6 +139,11 @@ class SensorMonitor:
             self._start_sim()
         elif app is not None and app.thread is not None and app.thread.is_alive():
             self._attach(app)
+        elif self.ctl is not None and getattr(self.ctl, "running", False):
+            # a session that is still stopping (or hung while stopping) holds the adapter: opening
+            # it here would fail, or take it from under that session's goodbye
+            with self.lock:
+                self.error = "上一次的追蹤還在結束中，藍芽還沒有釋放。請過幾秒後再試一次。"
         else:
             self._start_live()
         return self.mode
@@ -150,6 +156,10 @@ class SensorMonitor:
             self.app.core.tap = None
             self.app = None
         links, self.links = self.links, []
+        for l in links:                      # every goodbye starts at once (each stop() waits for its own)
+            flag = getattr(l, "stop_flag", None)
+            if flag is not None:
+                flag.set()
         for l in links:
             l.stop()
         for l in links:
@@ -253,10 +263,28 @@ class SensorMonitor:
         C.save_config({"bud_names": names})
 
     # ------------------------------------------------------------------ output
+    @staticmethod
+    def _link_info(l):
+        return {"addr": l.addr, "status": l.status, "kind": getattr(l, "model_kind", None),
+                "model_name": getattr(l, "model_name", None)}
+
     def snapshot(self, since=0):
         now = time.monotonic()
         names = self.names()
-        by_addr = {l.addr: l for l in (self.app.links if self.app is not None else self.links)}
+        # read once: stop() on another thread may set self.app to None between a check and its use
+        app = self.app
+        if app is not None and getattr(app, "thread", None) is not None and not app.thread.is_alive():
+            # the session we were watching ended by itself (SteamVR closed, an error): its buds
+            # would stay frozen on the page. Let go of it; the mode stays "tap", so the next
+            # tracking start attaches the page to the new session (Controller.start)
+            if self.app is app:
+                app.core.tap = None
+                self.app = None
+                with self.lock:
+                    self.buds.clear()
+            app = None
+        links = list(app.links if app is not None else self.links)
+        by_addr = {l.addr: l for l in links}
         with self.lock:
             out = []
             for src, b in sorted(self.buds.items()):
@@ -275,13 +303,19 @@ class SensorMonitor:
                 link = by_addr.get(b.addr)
                 sim = getattr(self, "sim_info", {}).get(b.addr, {}) if self.mode == "sim" else {}
                 out.append({
-                    "src": src, "addr": b.addr, "side": b.side, "name": name, "label": self.label(src),
+                    "src": src, "addr": b.addr, "side": b.side, "name": name, "label": self.label(src, names),
                     "kind": b.kind, "rate": round(b.rate(now), 1), "age": round(age, 2),
                     # which bud of the pair this is and what it looks like, from the buds themselves
                     "primary": getattr(getattr(link, "buds", None), "primary", None)
                     or (("left", "right")[b.side] if sim and b.side in (0, 1) else None),
                     "shape": sim.get("shape") or getattr(link, "shape", None),
                     "model": sim.get("model") or getattr(link, "model", None),
+                    # what the buds are and which motion stream they send: "raw" (RemoteHID),
+                    # "wx-raw" (SensorDataWX accelerometer + gyroscope, Pro 2 / Pro 3 / 4) or
+                    # "fused" (SensorDataWX attitude, about 100 Hz). The sample alone tells only
+                    # raw from fused, so a Pro 3 on the untested raw path looked like an AirPods 3.
+                    "model_name": getattr(link, "model_name", None),
+                    "stream": getattr(link, "model_kind", None) or b.kind,
                     "streaming": age < 1.0, "since": round(now - b.streaming_since, 1) if b.streaming_since else 0,
                     "samples": b.n, "R": [[round(float(x), 4) for x in row] for row in R],
                     "ypr": [round(yaw, 1), round(pitch, 1), round(roll, 1)],
@@ -292,8 +326,6 @@ class SensorMonitor:
                     "battery_all": bat,
                     "hist": [list(h[2:]) + [round(h[1] - now, 3)] for h in b.hist if h[0] > since][-400:],
                 })
-            links = [{"addr": l.addr, "status": l.status, "kind": l.model_kind} for l in self.links]
-            if self.app is not None:
-                links = [{"addr": l.addr, "status": l.status, "kind": l.model_kind} for l in self.app.links]
-            return {"mode": self.mode, "error": self.error, "seq": self.seq, "buds": out, "links": links,
+            return {"mode": self.mode, "error": self.error, "seq": self.seq, "buds": out,
+                    "links": [self._link_info(l) for l in links],
                     "events": [[round(t, 1), x] for t, x in list(self.events)[-12:]]}

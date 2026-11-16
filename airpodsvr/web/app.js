@@ -20,6 +20,8 @@ function failed(e) {
   toast(/Failed to fetch|NetworkError|Load failed/i.test(m) ? "與程式的連線中斷" : `操作失敗：${m}`);
 }
 const guard = fn => async (...a) => { try { return await fn(...a); } catch (e) { failed(e); } };
+// a number for display; a value the program could not work out comes as null (never NaN in JSON)
+const num = (x, d) => typeof x === "number" && isFinite(x) ? x.toFixed(d) : "–";
 window.addEventListener("unhandledrejection", e => { failed(e.reason); e.preventDefault(); });
 
 // ------------------------------------------------------------------ navigation
@@ -67,7 +69,7 @@ document.addEventListener("click", guard(async e => {
   const a = e.target.closest("[data-action]");
   if (a && !a.disabled) {
     await api("/api/action", { name: a.dataset.action, hand: a.dataset.hand || "left_hand", delay: +(a.dataset.delay || 0) });
-    if (a.dataset.delay) tick();                       // show the countdown at once
+    if (a.dataset.delay) tick();                       // show the countdown at once (same loop, sooner)
   }
   const f = e.target.closest("[data-flow]");
   if (f && !f.disabled) { const fl = await api("/api/flow/start", { kind: f.dataset.flow }); showFlow(fl); }
@@ -137,7 +139,7 @@ function renderLegs(st) {
   const ent = Object.entries(legs).sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]));
   el.innerHTML = ent.map(([k, v]) => `
     <div class="leg"><div class="leg-h">${zh[k] || k}<span class="badge ${v.ok ? "ok" : "bad"}">${v.ok ? "傳送中" : "無資料"}</span></div>
-    <div class="leg-v">${v.drift_deg_min >= 0 ? "+" : ""}${v.drift_deg_min.toFixed(2)}<span class="leg-u"> °/分</span></div>
+    <div class="leg-v">${typeof v.drift_deg_min === "number" && v.drift_deg_min >= 0 ? "+" : ""}${num(v.drift_deg_min, 2)}<span class="leg-u"> °/分</span></div>
     <div class="leg-u" title="這顆耳機的方向每分鐘自己偏多少：由你的重置和自動對齊在使用中量出來，之後會預先抵銷">學到的飄移速度${(() => { const leg = k.split("_")[0]; const P = st.pose && k.endsWith("shin") && st.pose[leg];
       return P ? " · " + (P.planted > 0.5 ? "著地" : "離地") : ""; })()}</div></div>`).join("");
 }
@@ -236,7 +238,7 @@ const PairBuds = (() => {
   const T = A => [[A[0][0], A[1][0], A[2][0]], [A[0][1], A[1][1], A[2][1]], [A[0][2], A[1][2], A[2][2]]];
   const I = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
   const SIDE = { left: "左耳（L）", right: "右耳（R）" }, OTHER = { left: "right", right: "left" };
-  const LINK = { connecting: "連線中", "waiting for sensors": "已連線，等資料", "needs pairing": "需要重新配對", idle: "準備中", stalled: "資料中斷，重試中" };
+  const LINK = { connecting: "連線中", "waiting for sensors": "已連線，等資料", "needs pairing": "需要重新配對", idle: "準備中", stalled: "資料中斷，重試中", "adapter lost": "USB藍芽已中斷：插回後請停止再開始追蹤" };
 
   function card(b) {
     const el = document.createElement("div");
@@ -336,7 +338,9 @@ let flowId = null;
 function showFlow(fl) {
   const m = $("#modal");
   if (!fl || fl.done) { m.hidden = true; flowId = null; PairBuds.open(null); return; }
-  const key = JSON.stringify([fl.id, fl.text, fl.buttons, fl.items, fl.progress, fl.step, fl.panel, fl.picture]);
+  // fl.shown (when the controller sends it) counts the showings of a step: one shown again unchanged
+  // after an answer is then drawn again, with its buttons back
+  const key = JSON.stringify([fl.id, fl.shown, fl.text, fl.buttons, fl.items, fl.progress, fl.step, fl.panel, fl.picture]);
   if (m.dataset.key === key && !m.hidden) return;
   m.dataset.key = key;
   flowId = fl.id;
@@ -374,10 +378,14 @@ function showFlow(fl) {
     if (buds && b === "下一步") el.disabled = !PairBuds.complete();
     el.onclick = () => {
       const choice = buds ? PairBuds.picks() : fl.items ? $$("input:checked", ul).map(x => +x.value) : null;
-      box.querySelectorAll("button").forEach(x => x.disabled = true);
-      // not delivered: give the buttons back, or the dialog is stuck with nothing to press
-      api("/api/flow/answer", { id: fl.id, value: b, choice })
-        .catch(e => { failed(e); box.querySelectorAll("button").forEach(x => x.disabled = false); });
+      const mine = [...box.querySelectorAll("button")];
+      mine.forEach(x => x.disabled = true);
+      // not delivered: give the buttons back, or the dialog is stuck with nothing to press.
+      // Delivered: Cancel comes back. A step can come back unchanged (an install that failed again
+      // at once), and without a way out the dialog stayed frozen until the window was closed.
+      api("/api/flow/answer", { id: fl.id, value: b, choice, shown: fl.shown })
+        .then(() => mine.forEach(x => { if (x.dataset.b === "取消" && x.isConnected) x.disabled = false; }))
+        .catch(e => { failed(e); mine.forEach(x => x.disabled = false); });
     };
     box.appendChild(el);
   });
@@ -449,8 +457,15 @@ async function loadSettings() {
 }
 
 // ------------------------------------------------------------------ main loop
-let logSeq = 0, lastMsg = "";
+// One loop only. A countdown button asks for the state at once by calling tick(); that used to start
+// one more loop per press, each polling for the rest of the session, and loops asking with the same
+// log position showed the same log lines several times. A call while a request is out now only
+// makes the next one come at once.
+let logSeq = 0, lastMsg = "", tickT = 0, ticking = false, tickAgain = false;
 async function tick() {
+  if (ticking) { tickAgain = true; return; }
+  ticking = true;
+  clearTimeout(tickT);
   try {
     const st = await api("/api/state?log=" + logSeq);
     S = st;
@@ -491,7 +506,10 @@ async function tick() {
     if (st.logs.length) log.scrollTop = log.scrollHeight;
   } catch (e) {
     $("#run-pill").querySelector("b").textContent = "與程式的連線中斷";
+  } finally {
+    ticking = false;
+    tickT = setTimeout(tick, tickAgain ? 0 : 400);
+    tickAgain = false;
   }
-  setTimeout(tick, 400);
 }
 tick();

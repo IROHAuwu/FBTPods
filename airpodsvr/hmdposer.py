@@ -23,10 +23,14 @@ import logging
 import math
 import os
 import pickle
+import sys
 import threading
+import time
 import zipfile
 
 import numpy as np
+
+from .learned import GAP_S
 
 log = logging.getLogger(__name__)
 
@@ -48,10 +52,28 @@ class _StorageType:
 
 def _rebuild_tensor(storage, offset, size, stride, *args, **kwargs):
     arr, = storage
+    # Offset, shape and strides come from the file. A view reaching outside the storage would read
+    # memory that is not ours: a damaged or tampered file would crash the whole app, past any
+    # exception handler. So check that every element lies inside the storage first.
+    try:
+        offset, size, stride = int(offset), tuple(int(n) for n in size), tuple(int(s) for s in stride)
+    except (TypeError, ValueError):
+        raise pickle.UnpicklingError("bad tensor layout in checkpoint") from None
+    if (not isinstance(arr, np.ndarray) or arr.ndim != 1 or len(size) != len(stride) or offset < 0
+            or any(n < 0 for n in size) or any(s < 0 for s in stride)):
+        raise pickle.UnpicklingError("bad tensor layout in checkpoint")
+    if 0 in size:
+        return np.zeros(size, arr.dtype)
+    if offset + sum((n - 1) * s for n, s in zip(size, stride)) >= arr.size:
+        raise pickle.UnpicklingError("tensor reaches outside its storage in checkpoint")
+    # a stride of 0 repeats one stored number any number of times: the copy below could take
+    # gigabytes from a few bytes of storage
+    if math.prod(size) * arr.itemsize > MAX_CHECKPOINT_BYTES:
+        raise pickle.UnpicklingError("tensor too large in checkpoint")
     if not size:
         return np.array(arr[offset])
     item = arr.itemsize
-    return np.lib.stride_tricks.as_strided(arr[offset:], shape=tuple(size),
+    return np.lib.stride_tricks.as_strided(arr[offset:], shape=size,
                                            strides=tuple(s * item for s in stride)).copy()
 
 
@@ -65,18 +87,29 @@ class _Unpickler(pickle.Unpickler):
     def __init__(self, f, zf, prefix):
         super().__init__(f)
         self.zf, self.prefix, self.cache = zf, prefix, {}
+        self.total = 0
+        self.copied = 0
 
     def find_class(self, module, name):
         if module == "collections" and name == "OrderedDict":
             import collections
             return collections.OrderedDict
         if module == "torch._utils" and name == "_rebuild_tensor_v2":
-            return _rebuild_tensor
+            return self._tensor
         if module == "torch._utils" and name == "_rebuild_parameter":
             return _rebuild_parameter
         if module == "torch" and name in _DTYPES:
             return _StorageType(name)
         raise pickle.UnpicklingError(f"refusing {module}.{name} in checkpoint")
+
+    def _tensor(self, *args, **kwargs):
+        """_rebuild_tensor, with all the tensors' copies together limited too: many tensors may be
+        views of one storage."""
+        t = _rebuild_tensor(*args, **kwargs)
+        self.copied += t.nbytes
+        if self.copied > MAX_CHECKPOINT_BYTES:
+            raise pickle.UnpicklingError("checkpoint tensor copies too large")
+        return t
 
     def persistent_load(self, pid):
         kind, stype, key = pid[0], pid[1], pid[2]
@@ -87,18 +120,128 @@ class _Unpickler(pickle.Unpickler):
         if dt is None:
             raise pickle.UnpicklingError(f"unsupported storage {name}")
         if key not in self.cache:
-            raw = self.zf.read(f"{self.prefix}/data/{key}")
+            name = f"{self.prefix}/data/{key}"
+            self.total += _member_size(self.zf, name)
+            if self.total > MAX_CHECKPOINT_BYTES:
+                raise pickle.UnpicklingError("checkpoint tensors too large")
+            raw = self.zf.read(name)
             self.cache[key] = np.frombuffer(raw, dtype=dt)
         return (self.cache[key],)
+
+
+# The real checkpoint is 103 MB. Without a limit a small file (a zip of zeros) could unpack to more
+# memory than the computer has before anything else is checked.
+MAX_CHECKPOINT_BYTES = 400_000_000
+
+
+def _member_size(zf, name):
+    size = zf.getinfo(name).file_size     # zipfile never returns more than this declared size
+    if size > MAX_CHECKPOINT_BYTES:
+        raise pickle.UnpicklingError(f"checkpoint member {name} too large")
+    return size
 
 
 def load_checkpoint(path):
     with zipfile.ZipFile(path) as zf:
         pkl = next(n for n in zf.namelist() if n.endswith("/data.pkl"))
         prefix = pkl[: -len("/data.pkl")]
+        _member_size(zf, pkl)
         obj = _Unpickler(io.BytesIO(zf.read(pkl)), zf, prefix).load()
     sd = obj.get("state_dict", obj) if isinstance(obj, dict) else obj
     return {k: np.asarray(v, dtype=np.float32) for k, v in sd.items()}
+
+
+# ------------------------------------------------------------------ BLAS threads
+# Every product in the network is small (8 tokens x 256). numpy's OpenBLAS still splits each one over
+# all cores: waking and syncing its threads costs far more than the arithmetic (measured 20-200 ms a
+# step instead of ~9 ms, with 2-3 cores busy), so the worker falls behind and takes cores from SteamVR
+# and the game. While a model's worker runs, BLAS is held to one thread. BLAS has one setting for the
+# whole process: the first worker in sets it, the last one out puts the old value back. Each does so
+# on its own thread, outside any BLAS call of its own.
+_blas_lock = threading.Lock()
+_blas_users = 0
+_blas_restore = None
+_openblas = []                 # [(get, set)] once looked up; [None] when there is none
+
+
+def _openblas_threads():
+    """(get, set) of the OpenBLAS numpy has loaded, or None. Windows only: the DLL is found among
+    the modules of this process and called directly (what threadpoolctl does, without needing it)."""
+    if _openblas:
+        return _openblas[0]
+    found = None
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32")          # own instance: the argtypes below stay local
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.K32EnumProcessModules.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.HMODULE),
+                                              wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        k32.K32EnumProcessModules.restype = wintypes.BOOL
+        k32.GetModuleFileNameW.argtypes = [wintypes.HMODULE, wintypes.LPWSTR, wintypes.DWORD]
+        k32.GetModuleFileNameW.restype = wintypes.DWORD
+        mods = (wintypes.HMODULE * 4096)()
+        need = wintypes.DWORD()
+        paths = []
+        if k32.K32EnumProcessModules(k32.GetCurrentProcess(), mods, ctypes.sizeof(mods), ctypes.byref(need)):
+            buf = ctypes.create_unicode_buffer(32768)
+            for h in mods[:min(len(mods), need.value // ctypes.sizeof(wintypes.HMODULE))]:
+                if h and k32.GetModuleFileNameW(h, buf, len(buf)) and "openblas" in os.path.basename(buf.value).lower():
+                    paths.append(buf.value)
+        for p in paths:
+            lib = ctypes.CDLL(p)                   # already loaded: the same module, nothing new runs
+            for pre in ("scipy_", ""):
+                for suf in ("64_", "", "_64"):
+                    get = getattr(lib, f"{pre}openblas_get_num_threads{suf}", None)
+                    put = getattr(lib, f"{pre}openblas_set_num_threads{suf}", None)
+                    if get is not None and put is not None and found is None:
+                        get.restype, get.argtypes = ctypes.c_int, []
+                        put.restype, put.argtypes = None, [ctypes.c_int]
+                        found = (get, put)
+    _openblas.append(found)
+    return found
+
+
+def _limit_blas():
+    """Hold BLAS to one thread; returns what puts the old setting back, or None if not possible."""
+    try:
+        from threadpoolctl import threadpool_limits
+    except ImportError:
+        threadpool_limits = None
+    if threadpool_limits is not None:
+        return threadpool_limits(limits=1, user_api="blas").restore_original_limits
+    ctl = _openblas_threads()
+    if ctl is None:
+        log.info("BLAS thread count left as it is (no OpenBLAS found to limit)")
+        return None
+    get, put = ctl
+    old = get()
+    put(1)
+    return lambda: put(old)
+
+
+def _blas_acquire():
+    global _blas_users, _blas_restore
+    with _blas_lock:
+        _blas_users += 1
+        if _blas_users == 1:
+            try:
+                _blas_restore = _limit_blas()
+            except Exception as e:   # noqa: BLE001 - only speed is at stake
+                log.warning("could not limit BLAS threads: %s", e)
+                _blas_restore = None
+
+
+def _blas_release():
+    global _blas_users, _blas_restore
+    with _blas_lock:
+        _blas_users -= 1
+        if _blas_users == 0 and _blas_restore is not None:
+            restore, _blas_restore = _blas_restore, None
+            try:
+                restore()
+            except Exception as e:   # noqa: BLE001
+                log.warning("could not restore BLAS threads: %s", e)
 
 
 # ------------------------------------------------------------------ network (numpy, one frame)
@@ -306,6 +449,8 @@ def fk(R_local, rest):
 class HmdPoser:
     """Same interface as learned.LearnedPose (step / kappa_hint / reset), plus pelvis orientation."""
 
+    STEP_LOG_N = 120           # steps timed for the one log line about this computer's speed
+
     def __init__(self, path, disagree_deg=30.0, threaded=True):
         self.net = HmdPoserNet(load_checkpoint(path))
         self.disagree = math.radians(disagree_deg)
@@ -314,8 +459,12 @@ class HmdPoser:
         self._cv = threading.Condition()
         self._pending = None
         self._closed = False
+        self._gen = 0              # counts reset()s: a step started before the last one is dropped
+        self._t_call = None
+        self._times = []
+        self._clear(0)
         self.reset()
-        if threaded:   # ~1-3 ms per frame on a desktop CPU: kept off the 90 Hz tracking loop
+        if threaded:   # several ms per step: kept off the 90 Hz tracking loop
             threading.Thread(target=self._worker, daemon=True, name="hmdposer").start()
         log.info("HMD-Poser model loaded: %s", os.path.basename(path))
 
@@ -328,22 +477,60 @@ class HmdPoser:
             self._cv.notify_all()
 
     def _worker(self):
-        while True:
-            with self._cv:
-                while self._pending is None and not self._closed:
-                    self._cv.wait()
-                if self._closed:
-                    return
-                snap, self._pending = self._pending, None
-            try:
-                self._run(*snap)
-            except Exception:   # noqa: BLE001
-                log.exception("HMD-Poser step")
+        _blas_acquire()
+        try:
+            while True:
+                with self._cv:
+                    while self._pending is None and not self._closed:
+                        self._cv.wait()
+                    if self._closed:
+                        return
+                    # reset() empties _pending together with counting up _gen: a snapshot taken
+                    # here always belongs to the current generation
+                    snap, gen, self._pending = self._pending, self._gen, None
+                try:
+                    if gen != self._run_gen:
+                        self._clear(gen)      # reset() asked for it: done here, between two steps
+                    t0 = time.perf_counter()
+                    pred = self._run(*snap)
+                    self._timed(time.perf_counter() - t0)
+                except Exception:   # noqa: BLE001
+                    log.exception("HMD-Poser step")
+                    continue
+                with self._cv:
+                    if gen == self._gen:      # not reset meanwhile: computed from the current state
+                        self.last = pred
+        finally:
+            _blas_release()
 
     def _run(self, t, sensors, p_head):
         dt = t - self._t_done if self._t_done is not None else 1.0 / FPS
         self._t_done = t
-        self.last = self.predict(self.features(dt, sensors), p_head)
+        return self.predict(self.features(dt, sensors), p_head)
+
+    def _clear(self, gen):
+        """Network state and input history: only ever touched by whoever runs the steps (the
+        worker thread, or the caller without it), so a reset cannot land in the middle of a step."""
+        self.net.reset()
+        self.prev = None
+        self.acc_lp = {}
+        self._t_done = None
+        self._run_gen = gen
+
+    def _timed(self, s):
+        """One log line on how long a step takes on this computer (the model wants 60 a second)."""
+        ts = self._times
+        if ts is None:
+            return
+        ts.append(s)
+        if len(ts) >= self.STEP_LOG_N:
+            self._times = None
+            ms = sorted(ts)[len(ts) // 2] * 1e3
+            if ms > 12.0:
+                log.warning("HMD-Poser: %.1f ms per step (median of %d): too slow for 60 a second, "
+                            "its hints will lag", ms, len(ts))
+            else:
+                log.info("HMD-Poser: %.1f ms per step (median of %d)", ms, len(ts))
 
     def set_body(self, body):
         """Scale the rest skeleton to the user and use their leg lengths (follows later height changes)."""
@@ -355,15 +542,17 @@ class HmdPoser:
             self.rest[ankle] = self.rest[ankle] * (body.shin / np.linalg.norm(self.rest[ankle]))
 
     def reset(self):
+        """Start afresh (full reset, or after a gap in the calls). With the worker thread, the
+        network state and input history are cleared by the worker before its next step, and a step
+        it is in the middle of is thrown away: it was computed from the old state."""
         with self._cv:
+            self._gen += 1
             self._pending = None
-        self.net.reset()
-        self.prev = None
-        self.acc_lp = {}
+            self.last = None
         self.acc_t = 0.0
         self.clock = 0.0
-        self._t_done = None
-        self.last = None
+        if not self.threaded:
+            self._clear(self._gen)
 
     @staticmethod
     def _rotvel(R_prev, R_cur, scale):
@@ -435,12 +624,18 @@ class HmdPoser:
 
     def step(self, dt, R_hmd, p_hmd, hands, shins, pelvis=None, acc=None):
         """hands: {"left_hand": (R, p), "right_hand": (R, p)} (missing -> hanging at the sides);
-        shins: [R_left, R_right]; pelvis: R or None; acc: {"left"/"right"/"pelvis": world accel}."""
+        shins: [R_left, R_right]; pelvis: R or None; acc: {"left"/"right"/"pelvis": world accel}.
+        Right after a reset, None until a prediction made after it exists."""
+        now = time.monotonic()
+        if self._t_call is not None and now - self._t_call > dt + GAP_S:
+            self.reset()              # not asked for a while: start afresh (see learned.GAP_S)
+        self._t_call = now
         self.clock += dt
         self.acc_t += dt
         if self.acc_t < 1.0 / FPS and self.last is not None:
             return self.last
-        self.acc_t = 0.0
+        # the remainder is kept: FPS steps a second at any loop rate (see LearnedPose.step)
+        self.acc_t = min(max(self.acc_t - 1.0 / FPS, 0.0), 1.0 / FPS)
         p_head = p_hmd + R_hmd @ HMD_TO_HEAD
         acc = acc or {}
         hs = {}
@@ -459,7 +654,7 @@ class HmdPoser:
                 self._pending = snap          # the newest frame wins if the worker is behind
                 self._cv.notify()
         else:
-            self._run(*snap)
+            self.last = self._run(*snap)
         return self.last
 
     def kappa_hint(self, pred, leg_i, hip_joint, R_seg):

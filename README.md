@@ -8,7 +8,7 @@ Strap AirPods to your legs and they become trackers for VRChat and other SteamVR
 
 [![Tests](https://github.com/IROHAuwu/fbtpods/actions/workflows/tests.yml/badge.svg)](https://github.com/IROHAuwu/fbtpods/actions/workflows/tests.yml)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0a84ff)
-![Interface](https://img.shields.io/badge/interface-EN%20%C2%B7%20%E7%B9%81%E4%B8%AD%20%C2%B7%20%E6%97%A5%E6%9C%AC%E8%AA%9E%20%C2%B7%20%ED%95%9C%EA%B5%AD%EC%96%B4-30d158)
+![Interface](https://img.shields.io/badge/interface-EN%20%C2%B7%20%E7%B9%81%E4%B8%AD%20%C2%B7%20%E6%97%A5%E6%9C%AC%E8%AA%9E%20%C2%B7%20%ED%95%9C%EA%B5%AD%EC%96%B4%20%C2%B7%20ES-30d158)
 ![Licence](https://img.shields.io/badge/code-Apache--2.0-bf5af2)
 
 **English** · [繁體中文](README.zh-TW.md)
@@ -23,7 +23,7 @@ Strap AirPods to your legs and they become trackers for VRChat and other SteamVR
 - Solves your hips, knees and feet from the headset and the buds, and sends them to SteamVR as trackers.
 - Portable: unzip, double-click `FBTPods.exe`. No Python, no installer.
 - Guided setup for Bluetooth, pairing and calibration, with a try-out mode that needs no hardware.
-- Interface in English, 繁體中文, 日本語 and 한국어 (Settings → Language).
+- Interface in English, 繁體中文, 日本語, 한국어 and Español (Settings → Language).
 
 ## Read this first
 
@@ -54,8 +54,9 @@ Strap AirPods to your legs and they become trackers for VRChat and other SteamVR
 | --- | --- | --- |
 | AirPods 3 | Raw accelerometer + gyro, 100 Hz | Main target, tested on hardware |
 | AirPods Pro (1st gen) | Raw accelerometer + gyro | Works (user reports) |
-| AirPods Pro 2 | Raw data when available, otherwise fused orientation at about 25 Hz | Experimental |
-| AirPods Pro 3, AirPods 4 | Expected to match Pro 2 | Experimental, untested |
+| AirPods Pro 2 | Raw data when available, otherwise fused orientation (the USB-C model A3048 sent nothing on raw services 11 / 12 and fused at about 100 Hz) | Connects and streams (A3048, sensor test together with a Pro 3); full-body tracking not yet tried |
+| AirPods Pro 3 | Fused orientation at about 100 Hz (raw services 11 / 12 sent nothing) | Connects and streams (A3064, sensor test with a TP-Link UB500); full-body tracking not yet tried |
+| AirPods 4 | Expected to match Pro 2 | Experimental, untested |
 | AirPods 2 | No gyroscope | Not usable |
 
 ## What you need
@@ -180,7 +181,9 @@ FBT Pods presents every paired pair as a SlimeVR tracker over SlimeVR's UDP prot
 | With 3–4 pairs a bud freezes or disappears | Set Bud sample rate to Automatic or 50 Hz |
 | "Needs pairing again" | The buds no longer know this PC. Run Pair again |
 | "Connected but no motion data" | Turn off Bluetooth on your iPhone / iPad / Mac |
-| AirPods Pro stop sending a few seconds after being put down or strapped on | Settings → Turn off automatic ear detection while in use (experimental) |
+| AirPods Pro stop sending a few seconds after being put down or strapped on | Settings → Turn off automatic ear detection while in use (experimental). It is switched back on when tracking stops, and also at the next connection if FBT Pods was closed abruptly |
+| AirPods Pro 2 / Pro 3 / AirPods 4: "connected but no motion data" | These buds answer sensor requests only from the device that is actively using them: turn off Bluetooth on your iPhone / iPad / Mac. The log names the model (e.g. `model A3064 (AirPods Pro 3)`) and says whether raw IMU or the ~100 Hz fused stream is used |
+| "USB Bluetooth adapter disconnected" | The adapter was unplugged or reset by Windows: plug it back in, then stop and start tracking |
 | A sensor no longer appears | Put the bud in its case and take it out again, or restart tracking |
 | Feet slowly turn | Quick reset. If far off, or lying down, use touch reset |
 | No trackers in SteamVR | Is Virtual trackers green? Restart SteamVR once, and check VMT under SteamVR Settings → Startup / Shutdown → Manage Add-ons |

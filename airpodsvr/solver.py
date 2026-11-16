@@ -196,6 +196,20 @@ class BodyPose:
     legs: dict            # "left"/"right" -> LegResult
 
 
+# Thighs measured: how the body is lowered onto the floor (see solve_body)
+LOWER_ENGAGE = math.radians(35)       # both shins slower than this: lower the body
+LOWER_RELEASE = math.radians(60)      # either shin faster than this: let the lowering fade out
+LOWER_FULL, LOWER_NONE = 0.10, 0.20   # feet this far above the floor: lowered fully / not at all
+
+
+@dataclass
+class Lowering:
+    """solve_body's 'lower the body onto the floor' (thighs measured), kept from frame to frame in
+    states["_lower"]."""
+    down: float = 0.0
+    engaged: bool = False
+
+
 def solve_body(hip_center, R_hip, shins: dict, body, states: dict, dt, speeds=None, floor=0.0, priors=None,
                thighs: dict | None = None, skating=True, stance: dict | None = None,
                lifts: dict | None = None):
@@ -213,15 +227,42 @@ def solve_body(hip_center, R_hip, shins: dict, body, states: dict, dt, speeds=No
         legs[leg] = r
     # thighs measured: forward kinematics hangs the legs from the head-estimated hip, so a hip guessed
     # a little too high leaves both feet floating. While standing / sitting still (legs slow), lower
-    # the whole body until the lowest foot touches the floor (up to 15 cm).
+    # the whole body until the lowest foot touches the floor (fully up to 10 cm, fading out by 20 cm:
+    # feet that high are really off the floor).
+    # The lowering is kept between frames and eased in and out. Switched fully on and off at one shin
+    # speed (or one gap size) it made the hip and both feet jump several cm whenever a shin crossed
+    # it, e.g. in a weight shift. Hysteresis on the speed; once released it fades instead of dropping.
     if thighs and legs and all(l in thighs for l in legs):
-        slow = all((speeds or {}).get(l, 0.0) < math.radians(40) for l in legs)
-        gap = min(r.ankle[1] - (floor + body.ankle_h) for r in legs.values())
-        if slow and 0.0 < gap < 0.15:
-            down = np.array([0.0, gap, 0.0])
+        low = states.get("_lower")
+        fresh = low is None
+        if fresh:
+            low = states["_lower"] = Lowering()
+        fastest = max((speeds or {}).get(l, 0.0) for l in legs)
+        if fastest > LOWER_RELEASE:
+            low.engaged = False
+        elif fastest < LOWER_ENGAGE:
+            low.engaged = True
+        gap = max(0.0, min(r.ankle[1] - (floor + body.ankle_h) for r in legs.values()))
+        if low.engaged:
+            fade = min(1.0, max(0.0, (LOWER_NONE - gap) / (LOWER_NONE - LOWER_FULL)))
+            target, tau = gap * fade, 0.25
+        else:
+            target, tau = 0.0, 0.4
+        if fresh:
+            # thighs just in use (tracking started, or the thigh buds are back): lowered at once.
+            # Without them the legs were solved standing on the floor; easing in from nothing would
+            # lift both feet off it for a moment.
+            low.down = target
+        else:
+            low.down += (target - low.down) * (1.0 - math.exp(-dt / tau))
+        d = min(low.down, gap)           # a lowering held from before never pushes a foot below the floor
+        if d > 0.0:
+            down = np.array([0.0, d, 0.0])
             hip_center = hip_center - down
             for r in legs.values():
                 r.knee, r.ankle = r.knee - down, r.ankle - down
+    else:
+        states.pop("_lower", None)       # thighs gone: start afresh (see above) when they come back
     if skating:
         for leg, r in legs.items():
             legs[leg] = skating_correction(r, states[leg], dt, stance=(stance or {}).get(leg))

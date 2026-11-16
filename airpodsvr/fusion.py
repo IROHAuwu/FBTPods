@@ -71,15 +71,27 @@ class BudFusion:
         self.gyr = np.zeros(3)
         self.acc = np.array([0.0, 0.0, 9.81])
         self.rest = False
+        self.fused = False         # the last sample was the bud's own attitude, not raw accel / gyro
 
     def update_fused(self, ts_ns, quat, gyr):
         """Buds that only give a fused attitude (SensorDataWX: AirPods Pro 2 / Pro 3 / 4): use it as is.
         Its world frame has Z up like VQF's, so the same conversion applies; heading drift is handled
-        downstream exactly like for raw IMU buds."""
+        downstream exactly like for raw IMU buds.
+
+        The quaternion is normalised first: the parser accepts a vector part a little over unit
+        length, and an unnormalised one gives a matrix that is not a rotation (stretched by up to 2%)
+        everywhere downstream. One that is not a number at all, or nearly zero, is refused (returns
+        None) and the last attitude is kept."""
+        q = np.asarray(quat, dtype=float)
+        g = np.asarray(gyr, dtype=float)
+        n = float(np.linalg.norm(q)) if q.shape == (4,) else 0.0
+        if not (math.isfinite(n) and n > 0.5 and np.all(np.isfinite(g))):
+            return None
         self.last_ts = ts_ns
         self.n += 1
-        self.gyr = np.asarray(gyr, dtype=float)
-        self.R_ws = E2W @ quat_to_mat(quat)
+        self.fused = True
+        self.gyr = g
+        self.R_ws = E2W @ quat_to_mat(q / n)
         self.rest = float(np.linalg.norm(self.gyr)) < 0.03
         return self.R_ws
 
@@ -101,6 +113,7 @@ class BudFusion:
         for _ in range(steps):
             self.f.update(g_eff, acc)
         self.n += 1
+        self.fused = False
         self.gyr, self.acc = gyr, acc
         q = self.f.getQuat6D()
         self.R_ws = E2W @ quat_to_mat(q)

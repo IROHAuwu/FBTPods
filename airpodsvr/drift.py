@@ -29,7 +29,7 @@ class DriftEstimator:
         self.body = body
         self.hmd_hist = deque()               # (t, p_hmd, heading)
         self.shin_hist = {}                   # leg -> deque((t, heading))
-        self.pending = {}                     # leg -> (t_measured, error_rad)
+        self.pending = {}                     # leg -> (t_measured, error_rad, _corrected then)
         self.enabled = cfg.get("auto_yaw", True)
         self.max_rate = math.radians(cfg.get("auto_yaw_max_deg_s", 0.5))
         self.gain = cfg.get("auto_yaw_gain", 0.3)        # 1/s
@@ -37,6 +37,10 @@ class DriftEstimator:
         self.pose, self.pose_since = None, 0.0
         self.rest_since = {}                  # role -> time it became still
         self.locked = {}                      # role -> heading kept while still
+        self.last_seen = {}                   # role -> time of the last update that included it
+        self._last_now = None                 # time of the last update
+
+    GAP_S = 0.5                               # no update for this long: what was held is forgotten
 
     def _pull(self, tr, err, dt, rest=False):
         if not self.enabled:
@@ -49,18 +53,54 @@ class DriftEstimator:
     # ---------------------------------------------------------------- relaxed poses
     def set_relaxed(self, kind, trackers: dict, body_heading):
         """Record how this person's legs naturally sit (toes out, knees apart) relative to the body,
-        while standing or sitting relaxed (SlimeVR 'Stay Aligned' relaxed poses)."""
-        self.relaxed[kind] = {role: wrap(heading_of(tr.R_seg()) - body_heading) for role, tr in trackers.items()}
+        while standing or sitting relaxed (SlimeVR 'Stay Aligned' relaxed poses). Only the segments
+        given are recorded: one left out (its bud not sending) keeps what was recorded for it before."""
+        rec = dict(self.relaxed.get(kind, {}))
+        rec.update({role: wrap(heading_of(tr.R_seg()) - body_heading) for role, tr in trackers.items()})
+        self.relaxed[kind] = rec
 
     def _target(self, kind, role, body_heading):
         return wrap(body_heading + self.relaxed.get(kind, {}).get(role, 0.0))
 
+    @staticmethod
+    def _corrected(tr):
+        """The segment's delta less what was turned only to keep its heading through a change of
+        the bud's heading reference (tracker.py: stream restart or switch). An error kept for the
+        quick reset is reduced by the corrections made since; that turn is none, and taken off as
+        one it made a quick reset turn the leg by up to 180 degrees."""
+        return wrap(tr.delta - getattr(tr, "heading_kept", 0.0))
+
+    def on_reset(self, role, replaced=False):
+        """A reset has just set this segment's heading. Held still, the rest lock takes it again from
+        the new heading at the next update: the heading it held is the one the reset corrected, and
+        pulling back to it undid the reset at 0.5 deg/s (and fed that to the drift-rate learning).
+        The walking anchor's heading history starts again too. After a full reset or the mounting
+        (delta replaced, not turned) an anchor error measured before means nothing any more."""
+        self.locked.pop(role, None)
+        self.shin_hist.pop(role, None)
+        if replaced:
+            self.pending.pop(role, None)
+
     def update(self, trackers: dict, R_hmd, p_hmd, body_heading, dt, now=None):
         now = time.monotonic() if now is None else now
         for tr in trackers.values():
-            tr.advance_drift(dt)
+            # (the learned drift rate itself is applied by Core.advance_drift, every frame, also
+            # while paused or while this is not called)
             if self.enabled and not tr.stale(now):
                 tr.note_auto_correction(0.0, dt)   # (the clock of the drift-rate learning)
+
+        # Not called for a while (paused, a shin without data), or a segment left out for a while
+        # (its bud stopped): the legs may have turned meanwhile, and the fusion followed. A heading
+        # held from before would pull them back, and a pose seen before is not held any more.
+        if self._last_now is not None and now - self._last_now > self.GAP_S:
+            self.pose, self.pose_since = None, now
+        self._last_now = now
+        for role in trackers:
+            if now - self.last_seen.get(role, now) > self.GAP_S:
+                self.rest_since.pop(role, None)
+                self.locked.pop(role, None)
+                self.shin_hist.pop(role, None)
+            self.last_seen[role] = now
 
         h_hmd = heading_of(R_hmd)
         self.hmd_hist.append((now, p_hmd.copy(), h_hmd))
@@ -102,7 +142,7 @@ class DriftEstimator:
             if now - self.pose_since > (1.5 if pose == "stand" else 2.5):
                 for role, tr in trackers.items():
                     err = wrap(self._target(pose, role, body_heading) - heading_of(tr.R_seg()))
-                    self.pending[role] = (now, err, tr.delta)
+                    self.pending[role] = (now, err, self._corrected(tr))
                     self._pull(tr, err, dt)
                     self.locked[role] = heading_of(tr.R_seg())
         else:
@@ -121,15 +161,16 @@ class DriftEstimator:
                     mean_h = math.atan2(np.mean(np.sin(hs)), np.mean(np.cos(hs)))
                     err = wrap(self._target("stand", role, v_heading) - mean_h)
                     if abs(err) < math.radians(60):
-                        self.pending[role] = (now, err, tr.delta)
+                        self.pending[role] = (now, err, self._corrected(tr))
                         self._pull(tr, err, dt)
 
         # --- rest lock (SlimeVR 'Stay Aligned' locked trackers): a segment that stays still keeps its
         # heading; whatever heading change shows up while it is still is drift. Works in any pose
         # (lying, sitting on the floor, legs crossed), which the anchors above cannot cover.
         for role, tr in trackers.items():
-            slow = tr.angular_speed() < math.radians(1.5)
-            if not slow or tr.angular_speed() > math.radians(3.0):
+            # still: under 1.5 deg/s to start, over 3 deg/s to stop. Noise or a twitch in between
+            # keeps the lock (dropping it, the lock came back a second later at the drifted heading).
+            if tr.rest_speed() >= math.radians(3.0 if role in self.rest_since else 1.5):
                 self.rest_since.pop(role, None)
                 self.locked.pop(role, None)
                 continue
@@ -149,5 +190,5 @@ class DriftEstimator:
         now = time.monotonic() if now is None else now
         v = self.pending.pop(leg, None)
         if v and now - v[0] < max_age:
-            return wrap(v[1] - wrap(tr.delta - v[2]))
+            return wrap(v[1] - wrap(self._corrected(tr) - v[2]))
         return None

@@ -1,3 +1,4 @@
--r requirements.txt
+# the app's own packages (a path after -r is read from this file's folder, hence ../packaging/)
+-r ../packaging/requirements.txt
 torch>=2.2
 onnx>=1.15

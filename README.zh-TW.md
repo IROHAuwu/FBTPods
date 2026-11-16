@@ -8,7 +8,7 @@
 
 [![Tests](https://github.com/IROHAuwu/fbtpods/actions/workflows/tests.yml/badge.svg)](https://github.com/IROHAuwu/fbtpods/actions/workflows/tests.yml)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0a84ff)
-![Interface](https://img.shields.io/badge/interface-EN%20%C2%B7%20%E7%B9%81%E4%B8%AD%20%C2%B7%20%E6%97%A5%E6%9C%AC%E8%AA%9E%20%C2%B7%20%ED%95%9C%EA%B5%AD%EC%96%B4-30d158)
+![Interface](https://img.shields.io/badge/interface-EN%20%C2%B7%20%E7%B9%81%E4%B8%AD%20%C2%B7%20%E6%97%A5%E6%9C%AC%E8%AA%9E%20%C2%B7%20%ED%95%9C%EA%B5%AD%EC%96%B4%20%C2%B7%20ES-30d158)
 ![Licence](https://img.shields.io/badge/code-Apache--2.0-bf5af2)
 
 [English](README.md) · **繁體中文**
@@ -23,7 +23,7 @@
 - 由頭顯和耳機算出髖部、膝蓋和腳，當成追蹤器送進 SteamVR。
 - 免安裝：解壓縮後雙擊 `FBTPods.exe`，不需要 Python。
 - 藍牙、配對、校正都有引導；沒有耳機也能用「試用模式」先看。
-- 介面有 English、繁體中文、日本語、한국어（Settings → Language；第一次開啟是英文）。
+- 介面有 English、繁體中文、日本語、한국어、Español（Settings → Language；第一次開啟是英文）。
 
 ## 使用前必讀
 
@@ -54,8 +54,9 @@
 | --- | --- | --- |
 | AirPods 3 | 原始加速度＋陀螺儀，100 Hz | 主要支援，實機驗證 |
 | AirPods Pro（第 1 代） | 原始加速度＋陀螺儀 | 可用（依實機回報） |
-| AirPods Pro 2 | 有原始資料就用，否則用耳機內建融合姿態（約 25 Hz） | 實驗性 |
-| AirPods Pro 3、AirPods 4 | 推測同 Pro 2 | 實驗性，未驗證 |
+| AirPods Pro 2 | 有原始資料就用，否則用耳機內建融合姿態（USB-C 型號 A3048：服務 11 / 12 沒有資料，融合姿態約 100 Hz） | 可連線並傳送資料（A3048，與 Pro 3 一起做感測器測試）；尚未試過全身追蹤 |
+| AirPods Pro 3 | 融合姿態約 100 Hz（原始資料服務 11 / 12 沒有資料） | 可連線並傳送資料（A3064，TP-Link UB500 感測器測試）；尚未試過全身追蹤 |
+| AirPods 4 | 推測同 Pro 2 | 實驗性，未驗證 |
 | AirPods 2 | 沒有陀螺儀 | 不能用 |
 
 ## 需要準備

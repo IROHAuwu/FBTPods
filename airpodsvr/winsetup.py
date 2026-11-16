@@ -114,10 +114,18 @@ def chip_info(dev):
 
 
 # ------------------------------------------------------------------ dongle
+# Windows PowerShell writes redirected output in the console's OEM code page (850, 437, ...), and
+# Python decodes it with the ANSI one (1252, ...): adapter names with é came out garbled, and a ü
+# (undefined in 1252) made the reader fail, so stdout was None and list_bt_usb crashed. Ask for
+# UTF-8 without a byte-order mark and decode it as such.
+_PS_UTF8 = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false\n"
+
+
 def _powershell(script, timeout=60):
-    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-                       capture_output=True, text=True, timeout=timeout, creationflags=NO_WINDOW)
-    return r.stdout.strip()
+    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", _PS_UTF8 + script],
+                       capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+                       creationflags=NO_WINDOW)
+    return (r.stdout or "").strip().lstrip("\ufeff")
 
 
 def list_bt_usb():

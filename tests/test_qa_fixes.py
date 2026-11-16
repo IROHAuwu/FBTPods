@@ -135,6 +135,7 @@ def test_calibration_save_error_does_not_stop_tracking(data, monkeypatch):
         raise PermissionError("calibration.json is in use")
     monkeypatch.setattr(C, "save_calibration", locked)
     a.start()
+    assert wait(lambda: a.core.last_pose is not None)       # the try-out buds are sending (resets need data)
     a.request("full_reset")
     assert wait(lambda: a.last_ok is True)
     assert a.thread.is_alive()
@@ -1737,6 +1738,7 @@ def test_aim_takes_out_a_leg_that_points_to_one_side():
             t.fusion.R_ws = np.eye(3)
             t.R_sm = rot_y(eps) if t is tr else np.eye(3)
             t.full_reset(0.0)
+            t.last_update = time.monotonic()                            # sending (aim needs data)
         body = types.SimpleNamespace(calibrate_from_eye=lambda y: None, height=1.7, eye=1.6)
         rm = ResetManager({"right_shin": tr, "left_shin": other}, body, types.SimpleNamespace(relaxed={}))
         assert abs(heading_of(tr.R_seg())) < 1e-6                       # standing: faces ahead

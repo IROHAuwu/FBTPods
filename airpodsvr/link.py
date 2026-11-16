@@ -15,12 +15,31 @@ import time
 from .transport import errtext, forgot_us
 from .sides import BudSides
 from .protocol import (HANDSHAKE_SEQUENCE, HDR, RHID_CONNECT, SVC_ACCEL, SVC_DEVMOTION6, SVC_GYRO, ProtocolState,
-                       bud_shape, parse_device_info,
+                       bud_shape, model_name, parse_device_info,
                        ear_detection, host_connect, rhid_frame, rhid_sub, set_report_interval, stem_enable, wx_raw_start,
                        wx_start_sequence, wx_stream)
 
 
 _seq_lock = threading.Lock()
+_cfg_lock = threading.Lock()        # links of several pairs update the same config lists at once
+
+# config: addresses whose automatic ear detection we switched off and have not switched on again
+# (the stop came while reconnecting, the app crashed or was killed). Put right at the next connect.
+EAR_OFF_KEY = "ear_detection_off_by_us"
+
+
+def _config_list_set(key, addr, present):
+    """Add (present=True) or remove `addr` in the config list `key`, writing only on a change.
+    -> whether it was in the list before."""
+    from . import config as C
+    with _cfg_lock:
+        cur = list(C.load_config().get(key) or [])
+        was = addr in cur
+        if present and not was:
+            C.save_config({key: cur + [addr]})
+        elif not present and was:
+            C.save_config({key: [a for a in cur if a != addr]})
+        return was
 
 
 def next_wx_seq(n=1):
@@ -61,6 +80,8 @@ class AirPodsLink(threading.Thread):
         self.stem = bool(stem)
         self.ear_off = bool(ear_off)     # switch the buds' automatic ear detection off while we use them
         self.ear_changed = False
+        self.ear_noted = None            # EAR_OFF_KEY holds this address: True / False / None (not read)
+        self.stem_changed = False        # stem presses taken over and not given back yet
         self.interval_us = int(interval_us)
         self.buds = BudSides(bud_info)
         self.swap, self.lr_certain = self.buds.resolve()
@@ -68,16 +89,18 @@ class AirPodsLink(threading.Thread):
         # with corrected labels either bud may be the wanted one: talk to both
         self.sides = (0, 1) if bud_info else tuple(sides)
         self.stop_flag = threading.Event()
+        self.bye_said = threading.Event()    # the link thread said goodbye (or ended): stop() waits for it
         self.chan = None
         self.state = None
         self.status = "idle"
         self.forgot = False                  # the AirPods no longer know us: pairing again is needed
+        self.lost_checked = False            # config 'lost_pairing' looked at since connecting
         self.stalls = 0                      # how often the stream stopped (diagnostics)
         self.ear = None
         self.battery = {}
         self.device_name = self.model = None    # from the device information packet, e.g. "A2084"
         self.model_kind = None          # "raw" (AirPods 3) | "wx-raw" (Pro 2 / Pro 3 / 4 raw IMU)
-                                        # | "fused" (SensorDataWX attitude, ~25 Hz)
+                                        # | "fused" (SensorDataWX attitude, ~100 Hz)
         self.last_sample = {}           # side -> monotonic time
         self.no_motion = False          # connected, but the buds sent no motion data (see _pump)
         self.record = open(record_path, "a", encoding="utf-8") if record_path else None
@@ -92,6 +115,11 @@ class AirPodsLink(threading.Thread):
         self.other_addrs = set()        # addresses of the same maker the buds mention (0x0c / 0x2b)
         self.record_all = False         # relay probe: keep every frame from then on
         self.hello_tries = {}           # side -> HostConnects sent to a side that never announced
+        # switched on on the current channel, so the goodbye switches off exactly that
+        self.wx_started = set()         # "raw" / "fused" SensorDataWX streams asked for
+        self.armed = set()              # sides whose RemoteHID accel + gyro were started
+        self.contained = {}             # what failed inside _pump without dropping the link -> count
+        self.said = set()               # one-time diagnostics already logged
 
     # ------------------------------------------------------------------ helpers
     RECORD_SENSOR_FRAMES = 1500          # of the ~100 per second; every other frame is always kept
@@ -109,10 +137,9 @@ class AirPodsLink(threading.Thread):
         """Kept in the config, so the window says "pair again" also after a restart (it used to go
         on showing these AirPods as paired)."""
         try:
-            from . import config as C
-            lost = list(C.load_config().get("lost_pairing") or [])
-            if self.addr not in lost:
-                C.save_config({"lost_pairing": lost + [self.addr]})
+            # under the same lock as _clear_lost: another pair's link may be taking itself off the
+            # list at the same moment, and one of the two changes would be lost
+            _config_list_set("lost_pairing", self.addr, True)
         except Exception as e:   # noqa: BLE001
             log.debug("lost pairing not saved: %s", e)
 
@@ -123,30 +150,120 @@ class AirPodsLink(threading.Thread):
     def _arm(self, side):
         for p in self.state.start_raw_imu(side, self.interval_us):
             self._send(p)
+        self.armed.add(side)
+
+    def _contained(self, what, e, pkt=None):
+        """Something failed inside _pump that concerns one packet or one sample: a packet the parser
+        chokes on (untested models, a damaged PDU) or a bug in whoever receives the data. It used to
+        drop the Bluetooth link, and a reconnect pages the buds again (seconds of frozen tracker, and
+        the other pairs on the adapter wait meanwhile). Said once per kind, then only counted."""
+        n = self.contained[what] = self.contained.get(what, 0) + 1
+        if n == 1:
+            log.warning("%s: %s failed (%s)%s; the link goes on, further failures are only counted",
+                        self.addr, what, errtext(e), f", packet {bytes(pkt[:32]).hex()}" if pkt else "",
+                        exc_info=True)
+        elif n in (10, 100, 1000) or n % 10000 == 0:
+            log.warning("%s: %s failed %d times so far (last: %s)", self.addr, what, n, errtext(e))
+
+    def _consume(self, what, fn, *args):
+        """Hand data to on_sample / on_event. Their failures stay theirs (see _contained); a
+        ConnectionError still ends the connection, as it would anywhere else in the link."""
+        try:
+            fn(*args)
+        except ConnectionError:
+            raise
+        except Exception as e:   # noqa: BLE001
+            self._contained(what, e)
+
+    def _note_ear_off(self, on):
+        """Keep in the config whether these AirPods have ear detection switched off by us (see
+        EAR_OFF_KEY). Written only when it changes; a failure costs only the self-repair."""
+        if self.ear_noted is on:
+            return
+        try:
+            _config_list_set(EAR_OFF_KEY, self.addr, on)
+            self.ear_noted = on
+        except Exception as e:   # noqa: BLE001
+            log.debug("%s: ear detection note not saved: %s", self.addr, e)
+
+    def _ear_on_connect(self):
+        """Ear detection off while we use the buds (option on). With the option off, switch it back
+        on if an earlier session switched it off and never could give it back."""
+        if self.ear_off:
+            self._note_ear_off(True)          # before sending: a crash right after must still be repaired
+            self._send(ear_detection(False))
+            if not self.ear_changed:
+                log.info("%s: automatic ear detection switched off (given back when tracking stops)", self.addr)
+            self.ear_changed = True
+            return
+        if self.ear_noted is None:
+            try:
+                from . import config as C
+                self.ear_noted = self.addr in (C.load_config().get(EAR_OFF_KEY) or [])
+            except Exception as e:   # noqa: BLE001
+                log.debug("%s: config not read: %s", self.addr, e)
+        if self.ear_noted:
+            self._send(ear_detection(True))
+            log.info("%s: automatic ear detection switched back on (left off by an earlier session)", self.addr)
+            self._note_ear_off(False)
+
+    def _clear_lost(self):
+        """Connected with the key we have: the AirPods know us. Take them off the config's "pair
+        again" list, which otherwise only the pair flow rewrites (a pair put there by mistake went
+        on being shown as needing pairing)."""
+        self.lost_checked = True
+        try:
+            if _config_list_set("lost_pairing", self.addr, False):
+                log.info("%s: connected with our pairing: no longer listed as needing pairing", self.addr)
+        except Exception as e:   # noqa: BLE001
+            log.debug("%s: lost pairing not updated: %s", self.addr, e)
+
+    def _close_record(self):
+        rec, self.record = self.record, None
+        if rec:
+            try:
+                rec.close()
+            except OSError:
+                pass
 
     # ------------------------------------------------------------------ main loop
     def run(self):
+        try:
+            self._run()
+        finally:
+            self.bye_said.set()
+            self._close_record()          # here, not in stop(): the thread may still be writing it
+
+    def _run(self):
         backoff = 1.0
         while not self.stop_flag.is_set():
             try:
                 self.status = "connecting"
+                self.chan = None                 # never the closed channel of an earlier connection
                 self.chan = self.backend.open(self.addr)
                 self.state = ProtocolState()
+                self.wx_started, self.armed = set(), set()
+                # stop() came while the buds were being paged: change nothing on them. What an
+                # earlier, lost connection changed is still given back by the goodbye below, after
+                # the handshake: before it the buds do not take commands, and the ear setting
+                # would count as given back although it never was.
+                if self.stop_flag.is_set() and not (self.stem_changed or self.ear_changed):
+                    break
                 for pkt, delay in HANDSHAKE_SEQUENCE:
                     self._send(pkt)
                     time.sleep(delay)
+                if self.stop_flag.is_set():
+                    break
                 for side in self.sides:
                     self._send(host_connect(self.state.next_gen(), side))
                 # double / triple / long press come to us (single press stays play/pause). Always
                 # sent: with the option off, 0 also repairs buds left changed by a crash.
                 self._send(stem_enable(0x0E if self.stem else 0x00))
                 self.stem_changed = self.stem
-                if self.ear_off:
-                    self._send(ear_detection(False))
-                    if not self.ear_changed:
-                        log.info("%s: automatic ear detection switched off (given back when tracking stops)", self.addr)
-                    self.ear_changed = True
+                self._ear_on_connect()
                 self.status = "waiting for sensors"
+                if self.forgot or not self.lost_checked:
+                    self._clear_lost()
                 self.forgot = False
                 backoff = 1.0
                 self._pump()
@@ -165,10 +282,23 @@ class AirPodsLink(threading.Thread):
                     backoff = 15.0           # retrying cannot help; do not hammer the buds
             finally:
                 if self.chan:
+                    if self.stop_flag.is_set():
+                        # the goodbye, said here on the link's own thread and channel before it
+                        # closes: said from stop() it raced with this close and was mostly lost.
+                        # Only on a real stop: after a lost link the next connection follows.
+                        self._goodbye()
+                        self.bye_said.set()
                     self.chan.close()
             if self.stop_flag.is_set():
                 break
-            self.status = "needs pairing" if self.forgot else f"reconnecting in {backoff:.0f}s"
+            if self.forgot:
+                self.status = "needs pairing"
+            elif getattr(self.backend, "lost", False):
+                # the USB adapter itself is gone: retrying through this backend cannot help, a new
+                # tracking session (stop, start) opens the adapter again once it is back
+                self.status = "adapter lost"
+            else:
+                self.status = f"reconnecting in {backoff:.0f}s"
             self.stop_flag.wait(backoff)
             backoff = min(backoff * 2, 15.0)
         self.status = "stopped"
@@ -196,7 +326,11 @@ class AirPodsLink(threading.Thread):
         wx_attempts = 0
         self.last_sample = {}
         self.wx_started = set()
+        self.armed = set()
         self.hello_tries = {}                  # per connection
+        # what this connection streams, from what arrives only (it was set to "fused" as soon as
+        # SensorDataWX was asked for, and the window showed that for pairs that sent nothing)
+        self.model_kind = None
         stalled = None                         # when the stream stopped, while it is stopped
         while not self.stop_flag.is_set():
             pkt = self.chan.recv(0.5)
@@ -207,11 +341,19 @@ class AirPodsLink(threading.Thread):
                 self._log_frame("rx", pkt)
                 if self.probe:
                     self._probe_note(pkt)
-                info = parse_device_info(pkt)
+                try:
+                    info = parse_device_info(pkt)
+                    events = self.state.feed(pkt, now)
+                except ConnectionError:
+                    raise
+                except Exception as e:   # noqa: BLE001 - one packet, not the link (see _contained)
+                    self._contained("parsing a packet", e, pkt)
+                    info, events = None, []
                 if info and info != (self.device_name, self.model):
                     self.device_name, self.model = info
-                    log.info("%s: model %s", self.addr, self.model or "?")
-                for ev in self.state.feed(pkt, now):
+                    name = self.model_name
+                    log.info("%s: model %s%s", self.addr, self.model or "?", f" ({name})" if name else "")
+                for ev in events:
                     kind = ev[0]
                     if self.probe and kind == "reply":
                         log.info("%s: probe: reply from side %d, kind %d, device %d: %s", self.addr, ev[1],
@@ -225,7 +367,13 @@ class AirPodsLink(threading.Thread):
                         self.status = "streaming"
                         label = s.side ^ 1 if self.swap else s.side
                         if label in self.want:
-                            self.on_sample(f"{self.addr}#{label}", s)
+                            self._consume("passing on a sample", self.on_sample, f"{self.addr}#{label}", s)
+                        elif not self.buds.has_base and ("unwanted", label) not in self.said:
+                            # never seen so far (a pair sends its primary bud's motion as side 0),
+                            # and the tracker of this pair would stay still: say so once
+                            self.said.add(("unwanted", label))
+                            log.info("%s: motion data labelled side %d, not used by this link (it uses %s)",
+                                     self.addr, label, ", ".join(str(w) for w in self.want) or "none")
                     elif kind == "primary":
                         if self.buds.observe_primary(ev[1], ev[2]):
                             log.info("%s: primary bud is the %s one%s", self.addr, ev[1],
@@ -245,12 +393,12 @@ class AirPodsLink(threading.Thread):
                             log.info("%s: primary bud %s, secondary bud %s", self.addr,
                                      place.get(ev[1][0], ev[1][0]), place.get(ev[1][1], ev[1][1]))
                         self.ear = ev[1]
-                        self.on_event("ear", self.addr, ev[1])
+                        self._consume("passing on an event", self.on_event, "ear", self.addr, ev[1])
                     elif kind == "stem":
-                        self.on_event("stem", self.addr, ev[1])
+                        self._consume("passing on an event", self.on_event, "stem", self.addr, ev[1])
                     elif kind == "battery":
                         self.battery = ev[1]
-                        self.on_event("battery", self.addr, ev[1])
+                        self._consume("passing on an event", self.on_event, "battery", self.addr, ev[1])
             # start (or re-start, after a re-announce) once both raw sensors of a side are known
             for side, t in list(announced_at.items()):
                 if now - t > 0.2:
@@ -277,17 +425,32 @@ class AirPodsLink(threading.Thread):
             raw_known = any(self.state.table.get(sd, "accel") is not None for sd in self.sides)
             if not streaming and not raw_known and now - t_open > 3.0 and now - wx_tried > 4.0:
                 wx_tried = now
-                # raw IMU first; if it does not come, the fused stream (and keep alternating)
+                # raw IMU first; if it does not come, the fused stream (and keep alternating). Once
+                # fused samples came on this connection and raw never paired, a stall asks for the
+                # fused stream again at once: asking for raw first kept the legs frozen 4 s longer.
                 self._start_wx(fused="raw" in getattr(self, "wx_started", set()) and not self.state.wx_raw_seen
-                               and wx_attempts % 2 == 1)
+                               and (self.state.wx_seen or wx_attempts % 2 == 1))
                 wx_attempts += 1
-                self.model_kind = self.model_kind or "fused"
             if raw_known:
                 self.model_kind = "raw"
             elif self.state.wx_raw_seen:
                 self.model_kind = "wx-raw"
             elif self.state.wx_seen:
                 self.model_kind = "fused"
+                if "raw" in self.wx_started and "fused" not in self.said:
+                    # raw IMU was asked for and the fused stream is what came: worth knowing when a
+                    # Pro 3 (untested here) tracks worse than expected
+                    self.said.add("fused")
+                    log.warning("%s: SensorDataWX raw accelerometer + gyroscope (services 11 / 12) asked for "
+                                "but no samples from it (%s): using the fused attitude stream instead "
+                                "(service 16, about 100 Hz)", self.addr, self._wx_raw_text())
+            if "raw" in self.wx_started and not self.state.wx_raw_seen and "unpaired" not in self.said:
+                n = sum(getattr(self.state, "wx_raw_n", {}).values())
+                n += sum(getattr(self.state, "wx_raw_odd", {}).values())
+                if n >= 50:
+                    self.said.add("unpaired")
+                    log.warning("%s: SensorDataWX raw reports arrive but no accelerometer + gyroscope pair "
+                                "forms (%s)", self.addr, self._wx_raw_text())
             # AirPointer: "the motion channel only answers just after a connection". Nothing at all
             # 25 s after opening: drop the link and connect again (backoff in run()).
             if not self.last_sample and now - t_open > 25.0:
@@ -380,9 +543,15 @@ class AirPodsLink(threading.Thread):
 
     def mark(self, label):
         """A labelled moment in the recording (what the user was asked to do from here on)."""
-        if self.record:
-            self.record.write(json.dumps({"t": round(time.monotonic() - self.t_start, 5), "mark": label}) + "\n")
-            self.record.flush()
+        rec = self.record
+        if rec:
+            # called from the probe flow's thread: the link thread closes the recording when it ends
+            # (a cancelled flow stops the links meanwhile), and a mark then has nowhere to go
+            try:
+                rec.write(json.dumps({"t": round(time.monotonic() - self.t_start, 5), "mark": label}) + "\n")
+                rec.flush()
+            except (OSError, ValueError):
+                pass
         log.info("%s: probe mark: %s", self.addr, label)
 
     def start_relay_probe(self):
@@ -423,6 +592,21 @@ class AirPodsLink(threading.Thread):
         """"pro" or "a3": which bud to draw."""
         return bud_shape(self.model, self.device_name, self.model_kind)
 
+    @property
+    def model_name(self):
+        """What the buds are, e.g. "AirPods Pro 3" (from their model number), or None if not known."""
+        return model_name(self.model)
+
+    def _wx_raw_text(self):
+        """What came of the SensorDataWX raw streams on this connection, for the log."""
+        n = getattr(self.state, "wx_raw_n", None) or {}
+        odd = getattr(self.state, "wx_raw_odd", None) or {}
+        text = f"{n.get(SVC_ACCEL, 0)} accel and {n.get(SVC_GYRO, 0)} gyro reports"
+        if odd:
+            text += "; other layouts (service, bytes, first byte): " + ", ".join(
+                f"{k} x{v}" for k, v in sorted(odd.items(), key=str)[:6])
+        return text + (f"; model {self.model}" if self.model else "")
+
     def lr_info(self):
         """For the status display and diagnostics."""
         return {"primary": self.buds.primary, "loc": {str(k): v for k, v in sorted(self.buds.loc.items())},
@@ -438,7 +622,7 @@ class AirPodsLink(threading.Thread):
                             self.addr, self.buds.predictions())
             else:
                 log.info("%s: left/right labels %s", self.addr, "swapped back" if swap else "as paired")
-        self.on_event("sides", self.addr, self.lr_info())
+        self._consume("passing on an event", self.on_event, "sides", self.addr, self.lr_info())
 
     def restore_stem(self):
         """Give stem presses back to the AirPods (double press = next track etc. on the phone again)."""
@@ -479,7 +663,10 @@ class AirPodsLink(threading.Thread):
                 time.sleep(0.05)
                 self.ear_changed = False
             except Exception as e:   # noqa: BLE001
-                log.warning("%s: could not switch ear detection back on (%s)", self.addr, e)
+                log.warning("%s: could not switch ear detection back on (%s); a later connection does it",
+                            self.addr, e)
+                return
+            self._note_ear_off(False)
 
     def set_stem(self, on):
         """Settings changed while connected."""
@@ -493,27 +680,54 @@ class AirPodsLink(threading.Thread):
             except Exception:   # noqa: BLE001
                 pass
 
-    def stop(self):
-        self.stop_flag.set()
-        if self.chan:
-            try:
-                for side in self.sides:
+    def _goodbye(self):
+        """Sensors off, stem presses and ear detection given back, on the current channel while it is
+        still open. Only what was switched on on this channel is switched off; the stem and ear
+        settings stay changed on the buds across a lost link, so they are given back here too.
+        Never raises."""
+        chan = self.chan
+        if chan is None or getattr(chan, "closed", False):
+            return                      # nothing to say it on (the ear setting is repaired later)
+        try:
+            if self.state is not None:
+                for side in sorted(self.armed):
                     for p in self.state.start_raw_imu(side, 0):
-                        self.chan.send(p)
-                started = getattr(self, "wx_started", set())
-                if started:
-                    seq = next_wx_seq(3)
-                    if "raw" in started:
-                        self.chan.send(wx_stream(seq, SVC_ACCEL, 0))
-                        self.chan.send(wx_stream(seq + 1, SVC_GYRO, 0))
-                    if "fused" in started:
-                        self.chan.send(wx_stream(seq + 2, SVC_DEVMOTION6, 0))
-            except Exception:   # noqa: BLE001
-                pass
-            self.restore_stem()
-            self.restore_ear()
+                        self._send(p)
+            started = self.wx_started
+            if started:
+                seq = next_wx_seq(3)
+                if "raw" in started:
+                    self._send(wx_stream(seq, SVC_ACCEL, 0))
+                    self._send(wx_stream(seq + 1, SVC_GYRO, 0))
+                if "fused" in started:
+                    self._send(wx_stream(seq + 2, SVC_DEVMOTION6, 0))
+        except Exception as e:   # noqa: BLE001
+            log.debug("%s: sensors not switched off (%s)", self.addr, errtext(e))
+        self.restore_stem()
+        self.restore_ear()
+
+    GOODBYE_WAIT = 1.5      # s stop() waits for the link thread's goodbye
+
+    def stop(self):
+        """Ask the link to end. A running link says its goodbye itself (see _goodbye), on its own
+        thread, right before it closes its channel; said from here it raced with that close and the
+        ear detection was hardly ever switched back on. This waits a moment for it, only while a
+        channel is open (not while the buds are being paged), and never long."""
+        self.stop_flag.set()
+        running = self.is_alive()
+        if running:
+            chan = self.chan
+            if self is not threading.current_thread() and chan is not None and not getattr(chan, "closed", False):
+                self.bye_said.wait(self.GOODBYE_WAIT)
+        else:
+            self._goodbye()             # not running (never started, or ended): nobody else will
         if self.probe and self.state is not None:
             log.info("%s: probe result: %s", self.addr, self.probe_summary())
-        if self.record:
-            self.record.close()
-            self.record = None
+        rec = self.record
+        if not running:
+            self._close_record()        # a running link closes it when its thread ends
+        elif rec:
+            try:
+                rec.flush()             # on disk already, should the thread still be paging a while
+            except (OSError, ValueError):
+                pass

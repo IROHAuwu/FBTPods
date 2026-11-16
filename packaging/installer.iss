@@ -30,17 +30,35 @@ Name: "chinesetrad"; MessagesFile: "ChineseTraditional.isl"
 #endif
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+; Text of our own, in the language picked when installing (it used to be Chinese for everyone)
+[CustomMessages]
+english.DesktopIcon=Create a desktop shortcut
+english.HardwareCheck=FBT Pods hardware check
+english.UninstallApp=Uninstall FBT Pods
+english.RunNow=Open FBT Pods now
+#ifexist "ChineseTraditional.isl"
+chinesetrad.DesktopIcon=建立桌面捷徑
+chinesetrad.HardwareCheck=FBT Pods 硬體驗證
+chinesetrad.UninstallApp=解除安裝 FBT Pods
+chinesetrad.RunNow=立即開啟 FBT Pods
+#endif
+
 [Tasks]
-Name: "desktopicon"; Description: "建立桌面捷徑"; Flags: checkedonce
+Name: "desktopicon"; Description: "{cm:DesktopIcon}"; Flags: checkedonce
 
 [Files]
 Source: "..\dist\FBTPods\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 
+[InstallDelete]
+; 1.0 named these in Chinese whatever the setup language; the new ones follow the setup language
+Type: files; Name: "{group}\FBT Pods 硬體驗證.lnk"
+Type: files; Name: "{group}\解除安裝 FBT Pods.lnk"
+
 [Icons]
 Name: "{group}\FBT Pods"; Filename: "{app}\FBTPods.exe"
-Name: "{group}\FBT Pods 硬體驗證"; Filename: "{app}\FBTPods-console.exe"; Parameters: "diag"
-Name: "{group}\解除安裝 FBT Pods"; Filename: "{uninstallexe}"
+Name: "{group}\{cm:HardwareCheck}"; Filename: "{app}\FBTPods-console.exe"; Parameters: "diag"
+Name: "{group}\{cm:UninstallApp}"; Filename: "{uninstallexe}"
 Name: "{userdesktop}\FBT Pods"; Filename: "{app}\FBTPods.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\FBTPods.exe"; Description: "立即開啟 FBT Pods"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\FBTPods.exe"; Description: "{cm:RunNow}"; Flags: nowait postinstall skipifsilent

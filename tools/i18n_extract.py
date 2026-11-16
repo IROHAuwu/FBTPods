@@ -88,6 +88,23 @@ def from_python(path):
     return out
 
 
+_JS_ESC = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v"}
+_JS_CODE = re.compile(r"u\{([0-9a-fA-F]{1,6})\}|u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})")
+
+
+def _js_escape(src, i):
+    """(text, index after it) of the escape sequence whose backslash is src[i]. "\\n" is a line
+    break on screen, as in a Python string, not the letter n: the key must be the text shown."""
+    m = _JS_CODE.match(src, i + 1)
+    if m:
+        cp = int(next(g for g in m.groups() if g), 16)
+        return (chr(cp) if cp <= 0x10FFFF else m.group(0)), m.end()
+    c = src[i + 1:i + 2]
+    if c in ("\n", "\r", "\u2028", "\u2029"):            # a line continued in the source: no text
+        return "", i + (3 if src.startswith("\r\n", i + 1) else 2)
+    return _JS_ESC.get(c, c), i + 2
+
+
 def from_js(src):
     """String literals of a script; ${...} in a template literal becomes {}."""
     out, n = [], len(src)
@@ -96,7 +113,8 @@ def from_js(src):
         buf = []
         while i < n and src[i] != "`":
             if src[i] == "\\":
-                buf.append(src[i + 1]); i += 2
+                t, i = _js_escape(src, i)
+                buf.append(t)
             elif src.startswith("${", i):
                 i = code(i + 2, "}")
                 buf.append("{}")
@@ -132,7 +150,8 @@ def from_js(src):
                 j, buf = i + 1, []
                 while j < n and src[j] != c:
                     if src[j] == "\\":
-                        buf.append(src[j + 1]); j += 2
+                        t, j = _js_escape(src, j)
+                        buf.append(t)
                     else:
                         buf.append(src[j]); j += 1
                 out.append("".join(buf))
@@ -177,9 +196,14 @@ def collect():
     def add(items, where):
         for t in items:
             found.setdefault(t, where)
-    for f in sorted(os.listdir(PKG)):
-        if f.endswith(".py") and f not in SKIP_PY:
-            add(from_python(os.path.join(PKG, f)), f)
+    # every subpackage too: transport/ raises errors (AirPods not answering, adapter unplugged)
+    # that the window shows as they are, so they need translations like everything else
+    for d, dirs, files in os.walk(PKG):
+        dirs[:] = sorted(x for x in dirs if x not in ("web", "__pycache__") and not x.startswith("."))
+        for f in sorted(files):
+            if f.endswith(".py") and f not in SKIP_PY:
+                p = os.path.join(d, f)
+                add(from_python(p), os.path.relpath(p, PKG).replace(os.sep, "/"))
     web = os.path.join(PKG, "web")
     for f in sorted(os.listdir(web)):
         p = os.path.join(web, f)
@@ -192,6 +216,10 @@ def collect():
 
 
 if __name__ == "__main__":
+    # the list is Chinese: printed into a pipe or file on Windows it would otherwise be encoded in
+    # the ANSI code page (cp1252 on English Windows) and stop at the first character it cannot hold
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     found = collect()
     if "--missing" in sys.argv:
         lang = sys.argv[sys.argv.index("--missing") + 1]

@@ -14,6 +14,7 @@ import concurrent.futures
 import logging
 import os
 import queue
+import re
 import threading
 
 from ..protocol import IOS_MTU, PSM_AACP
@@ -39,35 +40,80 @@ class _SignalingLog(logging.Filter):
         return True
 
 
+_L2CAP_HANDLED = {0x01, 0x04, 0x05}          # MTU, mode (retransmission / flow control), FCS
+_L2CAP_IGNORABLE = {0x02, 0x03, 0x06, 0x07}    # flush timeout, QoS, extended flow spec, extended window
+_patch_warned = set()                          # each "could not ..." said once per process
+_configure_seen = set()                        # (peer, PSM) whose Configure Request was logged
+
+
+def _warn_once(key, msg, *args):
+    if key not in _patch_warned:
+        _patch_warned.add(key)
+        log.warning(msg, *args)
+
+
+def _filter_configure_options(opts):
+    """The options Bumble should see: what it implements, minus what only describes how the peer
+    sends. An unknown option with the hint bit (0x80) set must be skipped, not rejected (Core spec
+    Vol 3 Part A 5); a hint on an option Bumble knows is passed on without the bit, so Bumble
+    recognises it. Returns (kept, dropped)."""
+    keep, dropped = [], []
+    for t, v in opts:
+        base = int(t) & 0x7F
+        if base in _L2CAP_IGNORABLE or (int(t) & 0x80 and base not in _L2CAP_HANDLED):
+            dropped.append((t, v))
+        else:
+            keep.append((base, v) if int(t) & 0x80 else (t, v))
+    return keep, dropped
+
+
 def _patch_l2cap_configure():
     """Bumble rejects every L2CAP configuration option it does not implement. The AirPods' Configure
     Request for the AACP channel carries Flush Timeout (0x02, 30 ms): Bumble answers 'unknown option',
     the AirPods ask a few more times and then close the channel, which surfaces as
-    'L2CAP/Connection failure'. Flush timeout, QoS and extended flow spec only describe how the peer
-    sends; a basic-mode receiver can accept them (BlueZ does). Strip them before Bumble looks."""
+    'L2CAP/Connection failure'. Flush timeout, QoS, extended flow spec and extended window size only
+    describe how the peer sends (or matter in a mode we do not use); a basic-mode receiver can accept
+    them (BlueZ does). Strip them before Bumble looks.
+
+    Everything this relies on is checked first: a Bumble release that renamed any of it gets one
+    warning and Bumble's own handling, instead of a backend that cannot start."""
     import dataclasses
-    from bumble import l2cap
-    cls = l2cap.ClassicChannel
-    if getattr(cls.on_configure_request, "_fbt_patched", False):
-        return
-    orig = cls.on_configure_request
-    ignorable = {0x02, 0x03, 0x06}            # flush timeout, QoS, extended flow specification
+    try:
+        from bumble import l2cap
+        cls = l2cap.ClassicChannel
+        orig = cls.on_configure_request
+        frame = l2cap.L2CAP_Control_Frame
+        decode, encode = frame.decode_configuration_options, frame.encode_configuration_options
+        if "options" not in {f.name for f in dataclasses.fields(l2cap.L2CAP_Configure_Request)}:
+            raise AttributeError("L2CAP_Configure_Request has no 'options' field")
+    except Exception as e:                    # noqa: BLE001
+        _warn_once("patch", "L2CAP configure fix not applied (this Bumble version differs: %s); AirPods "
+                   "whose Configure Request carries a flush timeout may refuse the motion channel", errtext(e))
+        return False
+    if getattr(orig, "_fbt_patched", False):
+        return True
 
     def on_configure_request(self, request):
         try:
-            opts = l2cap.L2CAP_Control_Frame.decode_configuration_options(request.options)
-            keep = [(t, v) for t, v in opts if (int(t) & 0x7F) not in ignorable]
-            if len(keep) != len(opts):
-                dropped = ", ".join(f"0x{int(t) & 0x7F:02x}={bytes(v).hex()}" for t, v in opts
-                                    if (int(t) & 0x7F) in ignorable)
-                log.debug("L2CAP configure: accepting %s", dropped)
-                request = dataclasses.replace(
-                    request, options=l2cap.L2CAP_Control_Frame.encode_configuration_options(keep))
+            raw = bytes(request.options)
+            seen = (str(getattr(getattr(self, "connection", None), "peer_address", "?")), getattr(self, "psm", None))
+            if seen not in _configure_seen and len(_configure_seen) < 64:
+                # what each model asks for, once: AirPods Pro 2 / 3 / 4 reports can be explained
+                _configure_seen.add(seen)
+                log.info("L2CAP configure request from %s (PSM %s): options %s", seen[0], seen[1], raw.hex())
+            opts = decode(raw)
+            keep, dropped = _filter_configure_options(opts)
+            if dropped or any(int(t) & 0x80 for t, _ in opts):         # something dropped or un-hinted
+                if dropped:
+                    log.debug("L2CAP configure: accepting %s",
+                              ", ".join(f"0x{int(t):02x}={bytes(v).hex()}" for t, v in dropped))
+                request = dataclasses.replace(request, options=encode(keep))
         except Exception as e:                # noqa: BLE001 - fall back to Bumble's own handling
-            log.debug("L2CAP configure options not filtered: %s", e)
+            _warn_once("filter", "L2CAP configure options not filtered: %s", errtext(e))
         return orig(self, request)
     on_configure_request._fbt_patched = True
     cls.on_configure_request = on_configure_request
+    return True
 
 
 def _log_l2cap_signaling():
@@ -77,7 +123,45 @@ def _log_l2cap_signaling():
     lg.setLevel(logging.DEBUG)
 
 
+class AdapterLost(ConnectionError):
+    """The USB Bluetooth adapter went away (unplugged, reset by Windows, a USB error): nothing can
+    be sent through this backend any more. Opening a new backend is the only way on."""
+
+
+# shown to the user (in the pairing screen's error, or as the reason a link keeps failing)
+ADAPTER_LOST_TEXT = "藍芽已中斷連線（USB藍芽被拔掉，或被 Windows 重置）：確認插好後再試一次"
+# the adapter still has Windows' own Bluetooth driver (the "Set up Bluetooth" step was not done, or
+# Windows put its driver back): libusb only says LIBUSB_ERROR_NOT_SUPPORTED
+NEEDS_DRIVER_TEXT = "USB藍芽還在用 Windows 的驅動程式：請先在總覽按「準備藍芽」，把它設定給 AirPods 用"
+KEY_NOT_SAVED_TEXT = "已配對，但配對資料無法存檔（檔案可能被防毒軟體或同步程式鎖住）：請再配對一次"
+
+
+def _cancel_requested():
+    """True when this task was asked to stop and still runs: on Python 3.11 asyncio.wait_for can
+    swallow a cancellation that arrives just as the awaited operation completes."""
+    task = asyncio.current_task()
+    return bool(task is not None and getattr(task, "cancelling", lambda: 0)())
+
+
+async def _hang_up(conn, drain_s=1.0):
+    """Disconnect an ACL link, after the data already queued on it has left (the goodbye packets a
+    link sends just before it closes: sensors off, stem presses and ear detection given back).
+    Best effort: errors are ignored, a cancellation is not."""
+    drain = getattr(conn, "drain", None)          # Bumble >= 0.0.236
+    if drain is not None:
+        try:
+            await asyncio.wait_for(drain(), drain_s)
+        except Exception:                          # noqa: BLE001 - disconnect anyway
+            pass
+    try:
+        await conn.disconnect()
+    except Exception:                              # noqa: BLE001
+        pass
+
+
 class BumbleChannel(Channel):
+    abandoned = False                  # the open() that made it gave up (see BumbleBackend.open)
+
     def __init__(self, backend, addr):
         self.backend = backend
         self.addr = addr
@@ -102,7 +186,10 @@ class BumbleChannel(Channel):
     def send(self, pkt):
         if self.closed or self.l2 is None:
             raise ConnectionError("channel closed")
-        self.backend.loop.call_soon_threadsafe(self.l2.send_pdu, bytes(pkt))
+        try:
+            self.backend.loop.call_soon_threadsafe(self.l2.send_pdu, bytes(pkt))
+        except RuntimeError as e:          # the backend was closed: its loop is gone
+            raise ConnectionError("channel closed") from e
 
     def recv(self, timeout):
         try:
@@ -120,13 +207,10 @@ class BumbleChannel(Channel):
         self.closed = True
         conn, self.conn = self.conn, None
         if conn is not None:
-            async def _bye():
-                try:
-                    await conn.disconnect()
-                except Exception:          # noqa: BLE001 - best effort
-                    pass
+            # what was sent just before (the goodbye packets) is only queued: a disconnect right
+            # away can overtake it, and the AirPods would keep ear detection off
             try:                           # the stack may already be shutting down
-                self.backend.run(_bye(), timeout=5)
+                self.backend.run(_hang_up(conn), timeout=5)
             except Exception:              # noqa: BLE001
                 pass
 
@@ -150,6 +234,48 @@ def use_bundled_firmware():
         os.environ.setdefault("BUMBLE_INTEL_FIRMWARE_DIR", os.path.join(root, "intel"))
 
 
+def _key_store(path):
+    """Bumble's JSON key store, saving the way config._atomic_write does. Its own save replaces the
+    file once; on Windows a virus scanner, the indexer or a sync client that has the fresh file open
+    makes that fail with a sharing violation, Bumble only logs it, and the new bond is gone although
+    pairing "succeeded"."""
+    import time
+    from bumble.keys import JsonKeyStore
+
+    class RetryingKeyStore(JsonKeyStore):
+        async def save(self, db):
+            for attempt in range(5):
+                try:
+                    return await super().save(db)
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    # a blocking wait on purpose (rare, 0.5 s at most): yielding here would let a
+                    # second update read the file before this one is written, and one would be lost
+                    time.sleep(0.05 * (attempt + 1))
+
+    return RetryingKeyStore(namespace=None, filename=path)
+
+
+async def _bond_saved(keystore, addr, wait=2.0):
+    """True once the key store holds a link key for `addr` (Bumble stores it in a task of its own,
+    shortly after authentication). True as well when there is no key store to ask."""
+    if keystore is None:
+        return True
+    want = str(addr).upper().split("/")[0]
+    loop = asyncio.get_running_loop()
+    end = loop.time() + wait
+    while True:
+        try:
+            if any(str(k).upper().split("/")[0] == want for k, _ in await keystore.get_all()):
+                return True
+        except Exception as e:             # noqa: BLE001 - unreadable file: same as no key
+            log.debug("key store: %s", errtext(e))
+        if loop.time() >= end:
+            return False
+        await asyncio.sleep(0.1)
+
+
 class _FirmwareLog(logging.Handler):
     """Notices which Bumble driver loaded a firmware (for the setup screen)."""
 
@@ -166,6 +292,8 @@ class _FirmwareLog(logging.Handler):
 
 
 class BumbleBackend:
+    NAME_LOOKUP_S = 20.0           # all name requests of one discover() together (its budget is +30 s)
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.transport_name = cfg.get("bumble_transport", "usb:0")
@@ -177,6 +305,9 @@ class BumbleBackend:
         self.device = None
         self.hci = None
         self.firmware = None              # "realtek" / "intel" when a firmware was loaded
+        self.lost = False                 # the USB adapter went away (see _transport_lost)
+        self._closing = self._closed = False
+        self._inflight = set()            # run() calls other threads are waiting on
         use_bundled_firmware()
         try:
             self.run(self._start(), timeout=90)   # Intel firmware upload takes a few seconds
@@ -185,18 +316,86 @@ class BumbleBackend:
             raise
 
     # ---------------------------------------------------------------- loop helpers
+    def _gone(self):
+        """The error for a call that can no longer be made (or was ended by close / adapter loss)."""
+        if getattr(self, "lost", False):
+            return AdapterLost(ADAPTER_LOST_TEXT)
+        return ConnectionError("Bluetooth closed")
+
     def run(self, coro, timeout=None):
-        fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        if getattr(self, "lost", False) or getattr(self, "_closed", False):
+            getattr(coro, "close", lambda: None)()    # (never started: no "never awaited" warning)
+            raise self._gone()
+        return self._submit(coro, timeout, guard=True)
+
+    def _submit(self, coro, timeout=None, guard=False):
+        try:
+            fut = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        except RuntimeError:              # close() in another thread closed the loop after run()'s check
+            getattr(coro, "close", lambda: None)()
+            raise self._gone() from None
+        # set.add / discard / list() are atomic under the GIL: no lock needed between link threads
+        inflight = self.__dict__.setdefault("_inflight", set())
+        inflight.add(fut)
+        if guard and (getattr(self, "lost", False) or getattr(self, "_closed", False)):
+            # the adapter was lost / the backend closed between run()'s check and the line above:
+            # the calls ended then did not include this one, which would wait out its whole timeout
+            fut.cancel()
         try:
             return fut.result(timeout)
         except (TimeoutError, concurrent.futures.TimeoutError):
             fut.cancel()                  # do not leave it running (and connecting) behind our back
             raise
+        except (concurrent.futures.CancelledError, asyncio.CancelledError):
+            if getattr(self, "lost", False) or getattr(self, "_closing", False):
+                raise self._gone() from None      # ended by close() / the adapter going away
+            raise
+        finally:
+            inflight.discard(fut)
+
+    def _transport_lost(self, fut=None):
+        """(on the loop) Bumble's USB source ended: the dongle was unplugged or reset, or a USB
+        transfer failed. Bumble then drops every link, but a new open() would send its commands to
+        the dead device and wait for answers until run() gives up (60 s, every retry, for ever).
+        From now on every call fails at once with AdapterLost, and those already waiting are ended."""
+        if fut is not None and not fut.cancelled():
+            fut.exception()               # (retrieved: no "exception was never retrieved" noise)
+        if getattr(self, "_closing", False) or getattr(self, "lost", False):
+            return                        # our own close(), or already said
+        self.lost = True
+        log.warning("Bluetooth adapter lost (unplugged, reset by Windows or a USB error): "
+                    "it has to be opened again")
+        for f in list(getattr(self, "_inflight", ())):
+            f.cancel()
+
+    async def _open_usb(self, open_transport):
+        """open_transport, and for 'usb:VID:PID' the next adapters of the same model when the first
+        one cannot be used: Bumble takes the first device with that vendor:product id, which may be
+        an identical dongle that Windows' own Bluetooth driver keeps (libusb cannot open it:
+        LIBUSB_ERROR_NOT_SUPPORTED). Any other error is raised as it is."""
+        name = self.transport_name
+        try:
+            return await open_transport(name)
+        except Exception as first:        # noqa: BLE001
+            if "NOT_SUPPORTED" not in str(first).upper():
+                raise
+            if not re.fullmatch(r"usb:(\[[^\]]*\])?[0-9A-Fa-f]{4}:[0-9A-Fa-f]{4}", name or ""):
+                raise ConnectionError(NEEDS_DRIVER_TEXT) from first
+            for i in range(1, 4):
+                try:
+                    hci = await open_transport(f"{name}#{i}")
+                except Exception as e:    # noqa: BLE001
+                    if "not found" in str(e).lower():
+                        break             # no more adapters of this model
+                    continue
+                log.warning("%s: the first adapter of this model cannot be opened (%s), probably the one "
+                            "Windows uses; using the next one (#%d)", name, errtext(first), i)
+                return hci
+            raise ConnectionError(NEEDS_DRIVER_TEXT) from first
 
     async def _start(self):
         from bumble.device import Device
         from bumble.hci import Address
-        from bumble.keys import JsonKeyStore
         from bumble.transport import open_transport
 
         os.makedirs(os.path.dirname(self.keystore_path), exist_ok=True)
@@ -205,7 +404,10 @@ class BumbleBackend:
             logging.getLogger(n).addHandler(fw_log)
             if logging.getLogger(n).getEffectiveLevel() > logging.INFO:
                 logging.getLogger(n).setLevel(logging.INFO)
-        self.hci = await open_transport(self.transport_name)
+        self.hci = await self._open_usb(open_transport)
+        terminated = getattr(getattr(self.hci, "source", None), "terminated", None)
+        if isinstance(terminated, asyncio.Future):     # set by Bumble when the USB device goes away
+            terminated.add_done_callback(self._transport_lost)
         # firmware loaders: Bumble's Realtek / Intel ones plus ours (Intel legacy, MediaTek,
         # Qualcomm); the latter need the libusb handle for vendor control transfers
         import inspect
@@ -224,7 +426,7 @@ class BumbleBackend:
         dev.classic_enabled = True
         dev.le_enabled = False
         dev.class_of_device = 0x0C010C           # computer / laptop
-        dev.keystore = JsonKeyStore(namespace=None, filename=self.keystore_path)
+        dev.keystore = _key_store(self.keystore_path)
         self._add_device_id_record(dev)
         await dev.power_on()
         self.firmware = btfw.last_driver or getattr(self, "firmware", None)
@@ -262,6 +464,7 @@ class BumbleBackend:
         Put the AirPods in pairing mode first (case open, hold the back button until white)."""
         async def _scan():
             found = {}
+            audio = set()
 
             def on_result(address, cod, data, rssi):
                 name = ""
@@ -274,25 +477,39 @@ class BumbleBackend:
                     pass
                 key = str(address)
                 found[key] = (address, name or found.get(key, (None, ""))[1])
+                try:
+                    if (int(cod) >> 8) & 0x1F == 0x04:      # major class Audio/Video: AirPods are
+                        audio.add(key)
+                except (TypeError, ValueError):
+                    pass
 
             self.device.on("inquiry_result", on_result)
-            await self.device.start_discovery(auto_restart=False)
-            await asyncio.sleep(seconds)
             try:
-                await self.device.stop_discovery()
-            except Exception:   # noqa: BLE001
-                pass
-            self.device.remove_listener("inquiry_result", on_result)
-            res = []
-            for key, (address, name) in found.items():
-                if not name:               # no name in the inquiry response: ask the device
-                    try:                   # (needs the Address object, not its text)
-                        name = await asyncio.wait_for(self.device.request_remote_name(address), 5)
-                    except Exception as e:   # noqa: BLE001
-                        log.debug("name of %s: %s", key, errtext(e))
-                        name = ""
-                res.append((key.split("/")[0], name))
-            return res
+                await self.device.start_discovery(auto_restart=False)
+                await asyncio.sleep(seconds)
+            finally:                       # also when the inquiry could not start
+                try:
+                    await self.device.stop_discovery()
+                except Exception:   # noqa: BLE001
+                    pass
+                self.device.remove_listener("inquiry_result", on_result)
+            # No name in the inquiry response: ask the device (needs the Address object, not its
+            # text), one after the other, up to 5 s each. Audio devices first and all of it within
+            # NAME_LOOKUP_S: in a crowded place a few silent devices used to run past run()'s budget,
+            # and everything found (the AirPods too) was lost with the timeout.
+            loop = asyncio.get_running_loop()
+            end = loop.time() + self.NAME_LOOKUP_S
+            names = {}
+            for key in sorted((k for k, (_, n) in found.items() if not n), key=lambda k: k not in audio):
+                left = end - loop.time()
+                if left < 0.5:
+                    log.debug("no time left to ask %s for its name", key)
+                    continue
+                try:
+                    names[key] = await asyncio.wait_for(self.device.request_remote_name(found[key][0]), min(5.0, left))
+                except Exception as e:   # noqa: BLE001
+                    log.debug("name of %s: %s", key, errtext(e))
+            return [(key.split("/")[0], name or names.get(key) or "") for key, (address, name) in found.items()]
 
         return self.run(_scan(), timeout=seconds + 30)
 
@@ -338,9 +555,11 @@ class BumbleBackend:
                 log.info("dropping a stale link to %s", addr)
                 try:
                     await asyncio.wait_for(old.disconnect(), 5)
-                except BaseException:      # noqa: BLE001
-                    pass
+                except Exception:          # noqa: BLE001 - never a cancellation: when run() has given
+                    pass                   # up, going on would leave a link nobody owns or closes
                 await asyncio.sleep(0.5)
+            if _cancel_requested():
+                raise asyncio.CancelledError()
             conn = await self.device.connect(addr, transport=PhysicalTransport.BR_EDR, timeout=20)
             try:                           # pairing / encryption inside the lock too: some adapters
                 await self._secure(conn)   # refuse a page while another link authenticates
@@ -396,8 +615,15 @@ class BumbleBackend:
             conn = await self._connect(addr)
             try:
                 await asyncio.wait_for(conn.disconnect(), 5)
-            except BaseException:          # noqa: BLE001 - best effort
+            except Exception:              # noqa: BLE001 - best effort
                 pass
+            # Authentication succeeding is not enough: the old key was deleted above, and a new one
+            # that could not be written to the file leaves no bond at all. Say so now, while the
+            # AirPods are still in pairing mode and pairing again can work.
+            if not await _bond_saved(getattr(self.device, "keystore", None), addr):
+                log.warning("pairing with %s: the link key was not saved to %s", addr,
+                            getattr(self, "keystore_path", "?"))
+                raise RuntimeError(KEY_NOT_SAVED_TEXT)
         # Start from nothing. A key kept from an earlier pairing is tried first otherwise, and when
         # the AirPods have dropped theirs (reset, or the case button held long) that fails with "PIN
         # or key missing", every time: these AirPods could never be paired again.
@@ -431,6 +657,15 @@ class BumbleBackend:
                                 or ch.conn is None:          # the whole link went (see _on_disconnected)
                             raise
                         await asyncio.sleep(1.5)
+                # Looked up once, without waiting: the key was stored right after authentication,
+                # long before the channel got here, and waiting would leave the open channel with
+                # nobody listening for its data or its close (wired up just below) for 2 s
+                if not await _bond_saved(getattr(self.device, "keystore", None), addr, wait=0):
+                    # the channel works now, but the next start will need pairing again
+                    log.warning("%s: no link key in %s after connecting: the bond was not saved", addr,
+                                getattr(self, "keystore_path", "?"))
+                if ch.abandoned or _cancel_requested():
+                    raise asyncio.CancelledError()   # run() gave up meanwhile: nobody would use it
             except BaseException:              # pairing refused, channel refused, or timed out
                 # connected but unusable: hang up, or every retry fails with "connection already
                 # exists" (the caller never gets this channel, so nobody else would)
@@ -450,16 +685,65 @@ class BumbleBackend:
             l2.on("close", gone)
             ch.l2 = l2
 
-        self.run(_open(), timeout=60)
+        try:
+            self.run(_open(), timeout=60)
+        except BaseException:
+            self._abandon(ch)
+            raise
         log.info("AACP channel open with %s", addr)
         return ch
 
+    def _abandon(self, ch):
+        """open() gave up on `ch` (timeout, close, adapter lost). The coroutine may still be going
+        on, or have finished just as the time ran out: then it holds a link marked as ours and an
+        open channel that nobody will read or close, and every retry to these AirPods fails with
+        "Connection Already Exists". Settled on the loop, where _open's own steps run, so there is no
+        race: either _open has finished (hang up here) or it sees the flag / its cancellation."""
+        def settle():
+            ch.abandoned = True
+            if ch.l2 is None:
+                return                         # _open still runs: it hangs up itself
+            conn, ch.conn = ch.conn, None
+            ch.closed = True
+            if conn is not None:
+                getattr(self, "_owned", set()).discard(conn)
+                log.info("%s: hanging up a link that was opened after open() gave up", ch.addr)
+                self.loop.create_task(_hang_up(conn, 0.2))
+        try:
+            self.loop.call_soon_threadsafe(settle)
+        except RuntimeError:                   # loop closed: the backend is gone, and its links
+            pass
+
+    async def _hang_up_all(self):
+        """Before the adapter is let go: disconnect every link still up (a link thread that did not
+        get to close its channel, or one still inside open()), and reset the controller for anything
+        else (a page in progress). Releasing the USB device does neither, and the dongle stays
+        powered: the AirPods would keep a connection to a host that is gone."""
+        dev = self.device
+        conns = list((getattr(dev, "connections", None) or {}).values())
+        if conns:
+            try:
+                await asyncio.wait_for(asyncio.gather(*(_hang_up(c, 0.5) for c in conns)), 1.5)
+            except Exception as e:             # noqa: BLE001
+                log.debug("hang up at close: %s", errtext(e))
+        try:
+            from bumble import hci
+            await asyncio.wait_for(dev.host.send_command(hci.HCI_Reset_Command()), 1)
+        except Exception as e:                 # noqa: BLE001
+            log.debug("controller reset at close: %s", errtext(e))
+
     def close(self):
+        if getattr(self, "_closed", False):
+            return
+        self._closing = True
+
         async def _stop():
+            if self.device is not None and not getattr(self, "lost", False):
+                await self._hang_up_all()
             if self.hci:
                 await self.hci.close()
         try:
-            self.run(_stop(), timeout=5)
+            self._submit(_stop(), timeout=5)       # (also after the adapter was lost: libusb's handles)
         except Exception:   # noqa: BLE001
             pass
         fw_log = getattr(self, "_fw_log", None)
@@ -467,4 +751,17 @@ class BumbleBackend:
             for n in ("bumble.drivers.rtk", "bumble.drivers.intel"):
                 logging.getLogger(n).removeHandler(fw_log)
             self._fw_log = None
-        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._closed = True
+        # calls other threads still wait on (a link inside open()) would wait out their whole
+        # timeout on a loop that no longer runs: end them now (they raise ConnectionError)
+        for fut in list(getattr(self, "_inflight", ())):
+            fut.cancel()
+        try:
+            self.loop.call_soon_threadsafe(self.loop.stop)
+        except RuntimeError:               # a close() in another thread got there first
+            return
+        th = getattr(self, "thread", None)
+        if th is not None and th is not threading.current_thread():
+            th.join(2)
+            if not th.is_alive():
+                self.loop.close()          # (the Proactor loop's handles and sockets)
