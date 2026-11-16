@@ -474,7 +474,7 @@ class Controller:
                   "idle": "準備中", "needs pairing": "耳機已不認得這台電腦", "stalled": "資料中斷，重試中",
                   "adapter lost": "USB藍芽已中斷：插回後請停止再開始追蹤"}
             kinds = {"raw": "原始 IMU 約 100 Hz", "wx-raw": "原始 IMU（Pro／4，實驗性）",
-                     "fused": "融合姿態約 25 Hz（實驗性）"}
+                     "fused": "融合姿態約 100 Hz（實驗性）"}
 
             def link_text(l):
                 s = l["status"]

@@ -7,10 +7,10 @@ window.Sensors = (() => {
   const EAR = { 0: "在耳內", 1: "離耳", 2: "在盒內", 3: "在盒內（蓋上）" };
   const ear = v => EAR[v] || "?";
   // the motion stream a bud sends: RemoteHID raw IMU (AirPods 3), SensorDataWX raw accelerometer and
-  // gyroscope (Pro 2 / Pro 3 / 4), or SensorDataWX attitude (about 25 Hz); the measured rate is
+  // gyroscope (Pro 2 / Pro 3 / 4), or SensorDataWX attitude (about 100 Hz measured on Pro 2 USB-C / Pro 3); the measured rate is
   // in the badge next to it
   const KIND = { raw: "原始 IMU", "wx-raw": "原始 IMU（Pro／4，實驗性）", fused: "融合姿態" };
-  const KIND_HELP = { raw: "原始 IMU 約 100 Hz", "wx-raw": "原始 IMU（Pro／4，實驗性）", fused: "融合姿態約 25 Hz（實驗性）" };
+  const KIND_HELP = { raw: "原始 IMU 約 100 Hz", "wx-raw": "原始 IMU（Pro／4，實驗性）", fused: "融合姿態約 100 Hz（實驗性）" };
   const fix = (x, d) => typeof x === "number" && isFinite(x) ? x.toFixed(d) : "–";
   const COL = ["#0a84ff", "#30d158", "#ff9f0a"];
   const WINDOW = 6;                       // seconds of gyro trace

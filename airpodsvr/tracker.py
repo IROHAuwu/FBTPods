@@ -260,7 +260,7 @@ class LegTracker:
         return self.fusion.R_ws
 
     def R_ws_predicted(self, now=None, max_dt=0.06):
-        """Orientation extrapolated with the gyro to `now`: smooths 25 Hz fused streams (Pro 2) at 90 Hz
+        """Orientation extrapolated with the gyro to `now`: smooths fused streams (Pro 2 / Pro 3) at 90 Hz
         output, the same idea as SlimeVR's prediction filter."""
         now = time.monotonic() if now is None else now
         dt = min(max(now - getattr(self, "last_arrival", now), 0.0), max_dt)

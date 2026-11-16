@@ -100,7 +100,7 @@ class AirPodsLink(threading.Thread):
         self.battery = {}
         self.device_name = self.model = None    # from the device information packet, e.g. "A2084"
         self.model_kind = None          # "raw" (AirPods 3) | "wx-raw" (Pro 2 / Pro 3 / 4 raw IMU)
-                                        # | "fused" (SensorDataWX attitude, ~25 Hz)
+                                        # | "fused" (SensorDataWX attitude, ~100 Hz)
         self.last_sample = {}           # side -> monotonic time
         self.no_motion = False          # connected, but the buds sent no motion data (see _pump)
         self.record = open(record_path, "a", encoding="utf-8") if record_path else None
@@ -443,7 +443,7 @@ class AirPodsLink(threading.Thread):
                     self.said.add("fused")
                     log.warning("%s: SensorDataWX raw accelerometer + gyroscope (services 11 / 12) asked for "
                                 "but no samples from it (%s): using the fused attitude stream instead "
-                                "(service 16, about 25 Hz)", self.addr, self._wx_raw_text())
+                                "(service 16, about 100 Hz)", self.addr, self._wx_raw_text())
             if "raw" in self.wx_started and not self.state.wx_raw_seen and "unpaired" not in self.said:
                 n = sum(getattr(self.state, "wx_raw_n", {}).values())
                 n += sum(getattr(self.state, "wx_raw_odd", {}).values())

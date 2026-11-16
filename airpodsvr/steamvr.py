@@ -23,8 +23,6 @@ ACTIONS = ("quick_reset", "full_reset", "touch_reset")
 # Bindings only work when SteamVR has loaded a binding file of ours for the controller type in use
 # and hands this program its input; with some setups (reported: Quest Pro over Virtual Desktop)
 # nothing arrived at all. The direct reading needs neither. "menu" is Y / B, "a" is X / A.
-# It stops for a controller once its bindings have delivered a press (they work: what the user
-# rebinds in SteamVR then counts), for as long as they stay active.
 DIRECT = {("left_hand", "menu", "double"): "quick_reset", ("left_hand", "menu", "long"): "full_reset",
           ("left_hand", "a", "long"): "touch_reset",
           ("right_hand", "menu", "long"): "touch_reset"}
@@ -135,7 +133,6 @@ class SteamVRBridge:
         self.prev = {}
         self.gestures = ButtonGestures()
         self.fired = {}                      # (action, hand) -> when it last fired, from either source
-        self.proven = set()                  # hands whose bindings delivered a press: not read directly while active
         self.said = {}                       # what was logged about the controllers, to say it once
         self.vmt_index = {}                  # "VMT_0" -> device index
         self.vmt_scan_t = -1e9
@@ -198,9 +195,6 @@ class SteamVRBridge:
                     fr.hands[hand] = openvr_matrix_to_np(std[i].mDeviceToAbsoluteTracking)
 
         bound = {}
-        proven = getattr(self, "proven", None)
-        if proven is None:
-            proven = self.proven = set()
         try:
             self.vr_input.updateActionState(self._action_sets())
             for a, h in self.action.items():
@@ -211,21 +205,13 @@ class SteamVRBridge:
                     state = bool(d.bActive and d.bState)
                     if state and not self.prev.get(key, False):
                         self._fire(fr, a, hand, now, "binding")
-                        if hand not in proven:
-                            proven.add(hand)
-                            log.info("controller %s: its bindings work, its buttons are read directly "
-                                     "only while they are not active", hand)
                     self.prev[key] = state
         except Exception as e:   # noqa: BLE001 - no bindings: the direct reading below still works
             self._say_once("actions", f"SteamVR bindings unavailable ({e}): reading the buttons directly")
-        # the same buttons, read directly. Not for a controller whose bindings have delivered a press
-        # and are active now: the fixed DIRECT gestures would undo whatever the user rebound in
-        # SteamVR's binding screen (a game's own Y held for 0.6 s still ran a full reset). Read
-        # again while its bindings are not active: an overlay application may get binding input
-        # only at times (no game running, dashboard open), and then the buttons would do nothing.
+        # the same buttons, read directly (unless switched off: controller_direct_buttons)
         pressed = {}
         for hand, i in index.items():
-            if not getattr(self, "direct", True) or (hand in proven and bound.get(hand)):
+            if not getattr(self, "direct", True):
                 for button in ("menu", "a"):     # when the reading comes back, it starts afresh (see forget)
                     self.gestures.forget((hand, button))
                 continue

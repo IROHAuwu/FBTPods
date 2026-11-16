@@ -312,7 +312,7 @@ class SensorMonitor:
                     "model": sim.get("model") or getattr(link, "model", None),
                     # what the buds are and which motion stream they send: "raw" (RemoteHID),
                     # "wx-raw" (SensorDataWX accelerometer + gyroscope, Pro 2 / Pro 3 / 4) or
-                    # "fused" (SensorDataWX attitude, about 25 Hz). The sample alone tells only
+                    # "fused" (SensorDataWX attitude, about 100 Hz). The sample alone tells only
                     # raw from fused, so a Pro 3 on the untested raw path looked like an AirPods 3.
                     "model_name": getattr(link, "model_name", None),
                     "stream": getattr(link, "model_kind", None) or b.kind,

@@ -432,7 +432,7 @@ def test_slimevr_gets_the_gyro_predicted_orientation_of_fused_buds(data, monkeyp
         tr.fusion.R_ws = np.eye(3)
         tr.fusion.gyr = np.array([0.0, 0.0, 3.0])
         tr.last_update = tr.last_arrival = t0
-    left.last_acc = None                                 # the bud's own attitude only (~25 Hz)
+    left.last_acc = None                                 # the bud's own attitude only (~100 Hz)
     right.last_acc = (0.0, 0.0, 9.8)                     # raw accelerometer + gyroscope
     a._send_slime(t0 + 0.02)
     a._send_slime(t0 + 0.03)                             # no new sample from either bud since

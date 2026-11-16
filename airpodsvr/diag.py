@@ -76,7 +76,7 @@ class Stats:
                 fused = np.array(st["fused"], dtype=bool)[m]
                 out[k] = {
                     "samples": int(m.sum()),
-                    # raw accel + gyro, or the fused attitude (~25 Hz): AirPods Pro 2 / Pro 3 / 4 send either
+                    # raw accel + gyro, or the fused attitude (~100 Hz): AirPods Pro 2 / Pro 3 / 4 send either
                     "stream": "fused" if fused.all() else ("raw" if not fused.any() else "mixed"),
                     "rate_hz": round(float(1.0 / np.median(dts)), 1) if np.median(dts) > 0 else 0,
                     "gaps_over_50ms": int((dts > 0.05).sum()),

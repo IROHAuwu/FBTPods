@@ -182,7 +182,7 @@ FBT Pods presents every paired pair as a SlimeVR tracker over SlimeVR's UDP prot
 | "Needs pairing again" | The buds no longer know this PC. Run Pair again |
 | "Connected but no motion data" | Turn off Bluetooth on your iPhone / iPad / Mac |
 | AirPods Pro stop sending a few seconds after being put down or strapped on | Settings → Turn off automatic ear detection while in use (experimental). It is switched back on when tracking stops, and also at the next connection if FBT Pods was closed abruptly |
-| AirPods Pro 2 / Pro 3 / AirPods 4: "connected but no motion data" | These buds answer sensor requests only from the device that is actively using them: turn off Bluetooth on your iPhone / iPad / Mac. The log names the model (e.g. `model A3064 (AirPods Pro 3)`) and says whether raw IMU or the ~25 Hz fused stream is used |
+| AirPods Pro 2 / Pro 3 / AirPods 4: "connected but no motion data" | These buds answer sensor requests only from the device that is actively using them: turn off Bluetooth on your iPhone / iPad / Mac. The log names the model (e.g. `model A3064 (AirPods Pro 3)`) and says whether raw IMU or the ~100 Hz fused stream is used |
 | "USB Bluetooth adapter disconnected" | The adapter was unplugged or reset by Windows: plug it back in, then stop and start tracking |
 | A sensor no longer appears | Put the bud in its case and take it out again, or restart tracking |
 | Feet slowly turn | Quick reset. If far off, or lying down, use touch reset |

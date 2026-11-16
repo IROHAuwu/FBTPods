@@ -464,9 +464,9 @@ class App:
                 self.stop_flag.wait(3)
 
     def _direct_buttons(self):
-        """Read the default reset buttons straight from the controllers until SteamVR bindings
-        for FBT Pods are seen working (steamvr.py). Off in the config for someone who removed every
-        binding on purpose and wants no button to reset anything."""
+        """Also read the default reset buttons straight from the controllers, not only through the
+        SteamVR bindings (steamvr.py). Off in the config for someone who removed every binding on
+        purpose and wants no button to reset anything."""
         return bool(self.cfg.get("controller_direct_buttons", True))
 
     def _mirror_autolaunch(self):

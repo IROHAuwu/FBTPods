@@ -914,7 +914,7 @@ def test_g7_5_a_step_shown_again_keeps_a_way_out(tmp_path):
 def test_sensor_page_shows_model_stream_closed_case_and_skips_unchanged_text(tmp_path):
     out = _page(tmp_path, "sensors")
     assert "AirPods Pro 3" in out["badges"] and "融合姿態" in out["badges"], out
-    assert "融合姿態約 25 Hz" in out["badges"]                                  # the tooltip
+    assert "融合姿態約 100 Hz" in out["badges"]                                  # the tooltip
     assert "主耳 在耳內／副耳 在盒內（蓋上）" in out["badges"] and "undefined" not in out["badges"]   # G7-11
     assert "角速度 <b>–</b>" in out["stats"]                                    # a value that is null
     assert out["links"] == "EE:FF 串流中 · AirPods Pro 3 · 融合姿態"
