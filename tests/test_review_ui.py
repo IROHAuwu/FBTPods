@@ -865,6 +865,14 @@ const out = {};
       src: "FF:EE:DD:CC:BB:AA#0", addr: "FF:EE:DD:CC:BB:AA", kind: "raw", stream: "wx-raw", shape: null, model: null }));
     load("app.js"); load("sensors.js");
     ctx.Sensors.visible(true);
+    // until both cards are drawn (a fixed 0.6 s was too short on a busy Windows runner: the card
+    // was not there yet), then the same 0.6 s of frames in which nothing may be written again
+    const cards = () => created.filter(e => e.className === "card bud");
+    for (let i = 0; i < 100; i++) {
+      const c = cards();
+      if (c.length > 1 && c.every(x => x.kids[".bud-ypr"] && x.kids[".bud-badges"] && x.kids[".bud-badges"]._html)) break;
+      await sleep(100);
+    }
     await sleep(600);
     const card = created.find(e => e.className === "card bud");
     out.badges = card.kids[".bud-badges"]._html;
