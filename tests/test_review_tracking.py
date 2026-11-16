@@ -335,6 +335,66 @@ def test_rest_speed_takes_off_the_gyro_bias_of_raw_buds_only():
 
 
 # ------------------------------------------------------------------ drift: pose anchors
+def test_looking_aside_while_standing_does_not_turn_the_legs(monkeypatch):
+    """G3-3: the pose anchor compared the head with its own 0.6 s low-pass, so standing still and
+    looking 40 deg aside turned legs that never moved 14 deg in 30 s (43 deg at 90 deg)."""
+    clock = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    core = _core(["left_shin", "right_shin"],
+                 {"trackers": {r: {"R_sm": I3.tolist(), "imu": 2} for r in ("left_shin", "right_shin")}})
+    p = np.array([0.0, core.body.eye, 0.0])
+    hz = 20                                                 # (the real loop runs at 90 Hz; same result)
+
+    def run(head_deg, seconds):
+        for _ in range(int(seconds * hz)):
+            clock[0] += 1 / hz
+            for tr in core.trackers.values():
+                tr.fusion.R_ws = I3.copy()
+                tr.fusion.gyr = np.zeros(3)
+                tr.last_update = tr.last_arrival = clock[0]
+            core.step(1 / hz, rot_y(math.radians(head_deg)), p, {})
+    run(0, 3)
+    run(40, 30)
+    for tr in core.trackers.values():
+        assert abs(_deg(heading_of(tr.R_seg()))) < 0.5
+    run(90, 30)
+    for tr in core.trackers.values():
+        assert abs(_deg(heading_of(tr.R_seg()))) < 0.5
+    run(20, 30)                    # (under POSE_MAX_ERR: only the head-on-legs check keeps them)
+    for tr in core.trackers.values():
+        assert abs(_deg(heading_of(tr.R_seg()))) < 0.5
+    run(10, 30)                                            # a little aside: pulled at most that far
+    for tr in core.trackers.values():
+        assert abs(_deg(heading_of(tr.R_seg()))) < 10.5
+
+
+def test_glancing_aside_and_back_does_not_turn_the_legs(monkeypatch):
+    """Review of G3-3: glances of 12 deg aside and back stay within POSE_HEAD_MAX of the legs; only
+    the head not holding its heading tells that it is not looking where the body faces. Without
+    that the still legs were pulled towards the glances."""
+    clock = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+    core = _core(["left_shin", "right_shin"],
+                 {"trackers": {r: {"R_sm": I3.tolist(), "imu": 2} for r in ("left_shin", "right_shin")}})
+    p = np.array([0.0, core.body.eye, 0.0])
+    hz = 20
+
+    def run(head_deg, seconds):
+        for _ in range(int(seconds * hz)):
+            clock[0] += 1 / hz
+            for tr in core.trackers.values():
+                tr.fusion.R_ws = I3.copy()
+                tr.fusion.gyr = np.zeros(3)
+                tr.last_update = tr.last_arrival = clock[0]
+            core.step(1 / hz, rot_y(math.radians(head_deg)), p, {})
+    run(0, 3)
+    for _ in range(12):
+        run(12, 2.5)
+        run(0, 2.5)
+    for tr in core.trackers.values():
+        assert abs(_deg(heading_of(tr.R_seg()))) < 1.0
+
+
 def test_standing_anchor_still_corrects_drift_through_core(monkeypatch):
     """The pose anchor keeps doing its job: legs drifted 8 deg, head looking where the body faces."""
     clock = [1000.0]
@@ -351,6 +411,29 @@ def test_standing_anchor_still_corrects_drift_through_core(monkeypatch):
         core.step(1 / 20, I3, p, {})
     for tr in core.trackers.values():
         assert abs(_deg(heading_of(tr.R_seg()))) < 1.0
+
+
+def test_sitting_without_a_recorded_relaxed_sit_pose_does_not_pull_the_knees_together():
+    """G3-M1: the wizard lets the relaxed sitting pose be skipped; the sit anchor then pulled knees
+    that naturally sit 15 deg apart to straight ahead."""
+    body = Body(1.70)
+    d = DriftEstimator({}, body)
+    d.relaxed = {"stand": dict.fromkeys(["left_shin", "right_shin", "left_thigh", "right_thigh"], 0.0)}
+    splay = math.radians(15)
+    true = {"left_shin": rot_y(splay), "right_shin": rot_y(-splay),
+            "left_thigh": rot_y(splay) @ axis_angle([1, 0, 0], math.radians(90)),
+            "right_thigh": rot_y(-splay) @ axis_angle([1, 0, 0], math.radians(90))}
+    trs = {}
+    for r, R in true.items():
+        t = LegTracker(r, r + "#0")
+        t.R_sm, t.fusion.R_ws = I3.copy(), R.copy()
+        trs[r] = t
+    t = 0.0
+    while t < 60:
+        t += 1 / 90
+        d.update(trs, I3, np.array([0.0, 1.20, 0.0]), 0.0, 1 / 90, now=t)
+    for r, tr in trs.items():
+        assert abs(_deg(wrap(heading_of(tr.R_seg()) - heading_of(true[r])))) < 0.5, r
 
 
 # ------------------------------------------------------------------ SensorDataWX stream changes

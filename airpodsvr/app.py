@@ -465,8 +465,9 @@ class App:
 
     def _direct_buttons(self):
         """Also read the default reset buttons straight from the controllers, not only through the
-        SteamVR bindings (steamvr.py). Off in the config for someone who removed every binding on
-        purpose and wants no button to reset anything."""
+        SteamVR bindings (steamvr.py: per action, until that action's binding is seen working). Off
+        in the config for someone who removed every binding on purpose and wants no button to reset
+        anything."""
         return bool(self.cfg.get("controller_direct_buttons", True))
 
     def _mirror_autolaunch(self):
