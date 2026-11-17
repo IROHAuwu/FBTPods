@@ -23,6 +23,9 @@ ACTIONS = ("quick_reset", "full_reset", "touch_reset")
 # Bindings only work when SteamVR has loaded a binding file of ours for the controller type in use
 # and hands this program its input; with some setups (reported: Quest Pro over Virtual Desktop)
 # nothing arrived at all. The direct reading needs neither. "menu" is Y / B, "a" is X / A.
+# A gesture stops being used for an action once that action's binding has delivered a press on
+# that controller (the binding works: what the user rebound in SteamVR then counts), for as long
+# as the bindings stay active. The other gestures keep working (bindings that work only in part).
 DIRECT = {("left_hand", "menu", "double"): "quick_reset", ("left_hand", "menu", "long"): "full_reset",
           ("left_hand", "a", "long"): "touch_reset",
           ("right_hand", "menu", "long"): "touch_reset"}
@@ -133,6 +136,7 @@ class SteamVRBridge:
         self.prev = {}
         self.gestures = ButtonGestures()
         self.fired = {}                      # (action, hand) -> when it last fired, from either source
+        self.proven = set()                  # (action, hand) its binding delivered: not fired directly while active
         self.said = {}                       # what was logged about the controllers, to say it once
         self.vmt_index = {}                  # "VMT_0" -> device index
         self.vmt_scan_t = -1e9
@@ -195,6 +199,9 @@ class SteamVRBridge:
                     fr.hands[hand] = openvr_matrix_to_np(std[i].mDeviceToAbsoluteTracking)
 
         bound = {}
+        proven = getattr(self, "proven", None)
+        if proven is None:
+            proven = self.proven = set()
         try:
             self.vr_input.updateActionState(self._action_sets())
             for a, h in self.action.items():
@@ -205,6 +212,10 @@ class SteamVRBridge:
                     state = bool(d.bActive and d.bState)
                     if state and not self.prev.get(key, False):
                         self._fire(fr, a, hand, now, "binding")
+                        if key not in proven:
+                            proven.add(key)
+                            log.info("controller %s: the %s binding works: its fixed gesture is not used "
+                                     "for it while the bindings are active", hand, a)
                     self.prev[key] = state
         except Exception as e:   # noqa: BLE001 - no bindings: the direct reading below still works
             self._say_once("actions", f"SteamVR bindings unavailable ({e}): reading the buttons directly")
@@ -225,8 +236,14 @@ class SteamVRBridge:
             pressed[(hand, "a")] = bool(mask & (1 << ov.k_EButton_A))
         for (hand, button), gesture in self.gestures.feed(now, pressed):
             a = DIRECT.get((hand, button, gesture))
-            if a:
-                self._fire(fr, a, hand, now, "direct")
+            if not a:
+                continue
+            if (a, hand) in proven and bound.get(hand):
+                # this action reaches us through the user's own binding: the fixed gesture would undo
+                # a rebinding (a game's Y held for 0.6 s ran a full reset). The press is used up here,
+                # so it does not fire either when the bindings go inactive while it is still held.
+                continue
+            self._fire(fr, a, hand, now, "direct")
         types = getattr(self, "_types", None)
         if types:                            # a controller gone: ask its successor's type anew
             for i in [i for i in types if i not in index.values()]:

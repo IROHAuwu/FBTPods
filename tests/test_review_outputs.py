@@ -86,6 +86,70 @@ def _hold(b, seconds=0.08):
     return events
 
 
+def test_direct_reading_stops_only_for_an_action_its_binding_has_delivered():
+    """The user moved the touch reset off X in SteamVR's binding screen and pressed it: X held in a
+    game no longer runs the fixed touch reset of the direct reading. The other gestures of that
+    controller, whose bindings never delivered anything, are still read directly."""
+    bindings, mask = {}, {}
+    b = _bridge(bindings, mask)
+    assert b.poll().events == []
+    bindings[("touch_reset", "left_hand")] = True                 # the user's own binding, pressed
+    assert b.poll().events == [("touch_reset", "left_hand")]
+    bindings[("touch_reset", "left_hand")] = False
+    b.poll()
+    assert b.proven == {("touch_reset", "left_hand")}
+    b.fired.clear()
+    mask[2] = 1 << 7                                              # left X held for the game
+    assert _hold(b) == []                                         # no touch reset from the direct reading
+    mask[2] = 0
+    b.poll()
+    mask[2] = 1 << 1                                              # left Y held: full reset, not proven
+    assert _hold(b) == [("full_reset", "left_hand")]
+    mask[2] = 0
+    mask[3] = 1 << 1                                              # the other controller: still direct
+    assert _hold(b) == [("touch_reset", "right_hand")]
+
+
+def test_partly_working_bindings_keep_the_quick_reset():
+    """Review of PR 1: bindings that deliver the long press but not the double press. After the
+    first long press through the bindings, the double press of Y still runs the quick reset."""
+    bindings, mask = {}, {}
+    b = _bridge(bindings, mask)
+    bindings[("full_reset", "left_hand")] = True
+    assert b.poll().events == [("full_reset", "left_hand")]
+    bindings[("full_reset", "left_hand")] = False
+    b.poll()
+    b.fired.clear()
+    events = []
+    for on in (True, False, True, False):                         # Y pressed twice, quickly
+        mask[2] = (1 << 1) if on else 0
+        events += b.poll().events
+    assert events == [("quick_reset", "left_hand")]
+    mask[2] = 1 << 1                                              # Y held: the bindings have it
+    assert _hold(b) == []
+
+
+def test_a_proven_gesture_is_read_directly_again_while_the_bindings_are_not_active():
+    """Bindings proven once (say, with no game running) and not active later (an overlay given no
+    binding input while a game has focus): the buttons must still work. A press the bindings had
+    (the game's own Y, held) is used up: it does not become a full reset when they go inactive."""
+    bindings, mask, active = {}, {}, {"on": True}
+    b = _bridge(bindings, mask, active=active)
+    bindings[("full_reset", "left_hand")] = True
+    assert b.poll().events == [("full_reset", "left_hand")]
+    bindings[("full_reset", "left_hand")] = False
+    b.poll()
+    b.fired.clear()
+    mask[2] = 1 << 1                                              # Y held while the bindings are active
+    assert _hold(b) == []
+    active["on"] = False                                          # a game took the focus, Y still held
+    assert _hold(b) == []
+    mask[2] = 0                                                   # let go and held again: read directly
+    b.poll()
+    mask[2] = 1 << 1
+    assert _hold(b) == [("full_reset", "left_hand")]
+
+
 def test_direct_button_reading_can_be_switched_off():
     mask = {2: 0}
     b = _bridge({}, mask)
